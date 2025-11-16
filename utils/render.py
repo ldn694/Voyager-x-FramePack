@@ -2,11 +2,25 @@ import numpy as np
 from PIL import Image
 import cv2
 import trimesh
+import torch
+import imageio.v2 as imageio  # pip install imageio[ffmpeg]
 
 class Camera:
+    @staticmethod
+    def _se3_inverse(w2c: np.ndarray) -> np.ndarray:
+        # w2c: (4,4)
+        R = w2c[:3, :3]
+        t = w2c[:3, 3]
+        R_T = R.T
+        t_inv = -R_T @ t
+        c2w = np.eye(4, dtype=w2c.dtype)
+        c2w[:3, :3] = R_T
+        c2w[:3, 3] = t_inv
+        return c2w
     def __init__(self, intrinsic_matrix, w2c_matrix):
         self.intrinsic_matrix = intrinsic_matrix
         self.w2c_matrix = w2c_matrix
+        # self.c2w_matrix = Camera._se3_inverse(w2c_matrix)
     def project_2d_to_3d(self, points_2d, depth):
         """
         Projects 2D image points to 3D world coordinates using the camera intrinsic and extrinsic parameters.
@@ -17,12 +31,14 @@ class Camera:
         """
         K_tensor = self.intrinsic_matrix
         w2c = self.w2c_matrix
+        # c2w = self.c2w_matrix
         fx, fy = K_tensor[0, 0], K_tensor[1, 1]
         cx, cy = K_tensor[0, 2], K_tensor[1, 2]
         x = (points_2d[:, 0] - cx) * depth / fx
         y = (points_2d[:, 1] - cy) * depth / fy
         z = depth
         points_3d_camera = np.vstack((x, y, z, np.ones_like(z))).T
+        # points_3d_world = (c2w @ points_3d_camera.T).T[:, :3]
         points_3d_world = (np.linalg.inv(w2c) @ points_3d_camera.T).T[:, :3]
         return points_3d_world
     def project_3d_to_2d(self, points_3d):
@@ -43,21 +59,24 @@ class Camera:
         return points_2d, z
 
 class Frame:
-    def __init__(self, rgb_path, depth_path=None, depth_range=None, is_reverse_depth=True, camera=None, depth_calibration=None):
-        self.rgb = Image.open(rgb_path).convert("RGB")
+    def __init__(self, rgb: Image.Image, 
+                 depth: np.ndarray, 
+                 camera: Camera, 
+                 is_reverse_depth: bool = True, 
+                 depth_calibration=None):
+        assert rgb.size[::-1] == depth.shape, "RGB and depth dimensions do not match."
+        assert isinstance(is_reverse_depth, bool), "is_reverse_depth should be a boolean."
+        assert depth_calibration is None or (isinstance(depth_calibration, tuple) and len(depth_calibration) == 2), \
+            "depth_calibration should be None or a tuple of (scale, shift)."
+        self.rgb = rgb
         if is_reverse_depth:
-            inverse_depth_normalized = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
-            lo, hi = depth_range
-            inverse_depth = inverse_depth_normalized.astype(np.float32) / 65535.0 * (hi - lo) + lo
-            self.depth = 1.0 / (inverse_depth + 1e-6)
+            self.depth = 1.0 / (depth + 1e-6)
         else:
-            self.depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED).astype(np.float32)
-            lo, hi = depth_range
-            self.depth = self.depth.astype(np.float32) / 65535.0 * (hi - lo) + lo
+            self.depth = depth
         if depth_calibration is not None:
             scale, shift = depth_calibration
             self.depth = self.depth * scale + shift
-        print(f"Min depth: {self.depth.min()}, Max depth: {self.depth.max()}")
+        # print(f"Min depth: {self.depth.min()}, Max depth: {self.depth.max()}")
         self.camera = camera
     def get_point_cloud(self):
         width, height = self.rgb.size
@@ -131,3 +150,16 @@ class Frame:
         mask = np.zeros_like(depth_buffer, dtype=np.uint8)
         mask[depth_buffer != np.inf] = 255
         return rendered_image, mask, depth_buffer
+
+def tensor_to_mp4(tensor: torch.Tensor, out_path: str, fps: int = 25) -> None:
+    """
+    tensor: (3, T, H, W) from torchvision.transforms.ToTensor (values in [0,1])
+    out_path: e.g. "video.mp4"
+    """
+    # (3, T, H, W) -> (T, H, W, 3)
+    vid = tensor.detach().cpu().clamp(0, 1).permute(1, 2, 3, 0)
+    # to uint8
+    vid = (vid * 255).to(torch.uint8).numpy()
+
+    # write mp4 (readable in VS Code / any standard player)
+    imageio.mimsave(out_path, vid, fps=fps, format="FFMPEG", codec="libx264")
