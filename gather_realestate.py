@@ -132,7 +132,7 @@ if __name__ == "__main__":
             rendered_image, mask, depth_buffer = norm_partial_render_output(
                 rendered_image, mask, depth_buffer
             )
-            print(f"Min depth buffer: {depth_buffer.min()}, Max depth buffer: {depth_buffer.max()}")
+            # print(f"Min depth buffer: {depth_buffer.min()}, Max depth buffer: {depth_buffer.max()}")
             # Save RGB
             rgb_path = os.path.join(input_rgb_folder, f'{i:03d}.png')
             if not os.path.exists(rgb_path):
@@ -145,7 +145,7 @@ if __name__ == "__main__":
             mask_path = os.path.join(input_mask_folder, f'{i:03d}.png')
             if not os.path.exists(mask_path):
                 cv2.imwrite(mask_path, mask)
-            print(f"Min rgb: {rendered_image.min()}, Max rgb: {rendered_image.max()}")
+            # print(f"Min rgb: {rendered_image.min()}, Max rgb: {rendered_image.max()}")
             total_rendered_image_tensor.append((torch.from_numpy(rendered_image).float().permute(2,0,1) / 255.0).contiguous())  # (3, H, W)
         total_rendered_image_tensor = torch.stack(total_rendered_image_tensor, dim=1)  # (3, T, H, W)
         input_video_path = os.path.join(input_folder, 'video.mp4')

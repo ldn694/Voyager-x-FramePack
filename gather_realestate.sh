@@ -1,0 +1,1 @@
+python gather_realestate.py --dataset_root /raid/hvtham/ldnhuan/data/RealEstate10K --output_root dataset/RealEstate10K/refined_test_150_768x512 --split refined_test_150 --width 768 --height 512
