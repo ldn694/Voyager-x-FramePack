@@ -166,7 +166,7 @@ class Transport:
             return t * self.training_timesteps
 
     def training_losses(self, model, x1, model_kwargs=None, timestep=None, n_tokens=None,
-                        i2v_mode=False, cond_latents=None, args=None):
+                        i2v_mode=False, cond_latents=None, args=None, partial_cond=None, partial_mask=None):
 
         self.shift = self.video_shift
         if model_kwargs == None:
@@ -205,7 +205,9 @@ class Transport:
             else None
         )
         model_kwargs["guidance"] = guidance_expand
-
+        xt = xt.to(model.dtype)
+        if partial_cond is not None and partial_mask is not None:
+            xt = th.concat([xt, partial_cond, partial_mask], dim=1) 
         model_output = model(xt, input_t, **model_kwargs)['x']
 
         if i2v_mode and args.i2v_condition_type == "token_replace":

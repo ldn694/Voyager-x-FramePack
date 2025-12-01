@@ -98,19 +98,23 @@ def get_cond_latents(args, latents, vae):
     )
     first_images_pixel_values = [
         image_transform(image) for image in first_images]
+    # first_images_pixel_values = (
+    #     torch.cat(first_images_pixel_values).unsqueeze(
+    #         0).unsqueeze(2).to(vae.device)
+    # )
     first_images_pixel_values = (
-        torch.cat(first_images_pixel_values).unsqueeze(
-            0).unsqueeze(2).to(vae.device)
+        torch.stack(first_images_pixel_values).unsqueeze(2).to(vae.device) # A critical error of original code, fixed here
     )
 
     vae_dtype = PRECISION_TO_TYPE[args.vae_precision]
-    with torch.autocast(
-        device_type="cuda", dtype=vae_dtype, enabled=vae_dtype != torch.float32
-    ):
-        cond_latents = vae.encode(
-            first_images_pixel_values
-        ).latent_dist.sample()  # B, C, F, H, W
-        cond_latents.mul_(vae.config.scaling_factor)
+    with torch.no_grad():
+        with torch.autocast(
+            device_type="cuda", dtype=vae_dtype, enabled=vae_dtype != torch.float32
+        ):
+            cond_latents = vae.encode(
+                first_images_pixel_values
+            ).latent_dist.sample()  # B, C, F, H, W
+            cond_latents.mul_(vae.config.scaling_factor)
 
     return cond_latents
 
@@ -121,9 +125,10 @@ def get_cond_images(args, latents, vae, is_uncond=False):
         latents[:, :, 0, ...] if len(latents.shape) == 5 else latents
     )
     sematic_image_latents = 1 / vae.config.scaling_factor * sematic_image_latents
-    semantic_images = vae.decode(
-        sematic_image_latents.unsqueeze(2).to(vae.dtype), return_dict=False
-    )[0]
+    with torch.no_grad():
+        semantic_images = vae.decode(
+            sematic_image_latents.unsqueeze(2).to(vae.dtype), return_dict=False
+        )[0]
     semantic_images = semantic_images.squeeze(2)
     semantic_images = (semantic_images / 2 + 0.5).clamp(0, 1)
     semantic_images = semantic_images.cpu().permute(0, 2, 3, 1).float().numpy()
@@ -230,20 +235,31 @@ def prepare_model_inputs(
     rope_interpolation_factor: Union[float, List[float]] = 1.0,
 ):
     media, latents, *batch_args = batch
-    if len(batch_args) == 3:
-        text_ids, text_mask, kwargs = batch_args
-        text_ids_2, text_mask_2 = None, None
-    elif len(batch_args) == 5:
-        text_ids, text_mask, text_ids_2, text_mask_2, kwargs = batch_args
+    if args.use_cache_text_encoder:
+        if len(batch_args) == 4:
+            text_states, text_mask, text_states_2, kwargs = batch_args
+        elif len(batch_args) == 3:
+            text_states, text_mask, kwargs = batch_args
+            text_states_2 = None
+        else:
+            raise ValueError(f"Unexpected batch_args.")
     else:
-        raise ValueError(f"Unexpected batch_args.")
+        text_states, text_mask, text_states_2 = None, None, None
+        if len(batch_args) == 3:
+            text_ids, text_mask, kwargs = batch_args
+            text_ids_2, text_mask_2 = None, None
+        elif len(batch_args) == 5:
+            text_ids, text_mask, text_ids_2, text_mask_2, kwargs = batch_args
+        else:
+            raise ValueError(f"Unexpected batch_args.")
     data_type = kwargs["type"][0]
 
     # Move batch to device
     media = media.to(device)
     latents = latents.to(device)
-    text_ids = text_ids.to(device)
-    text_mask = text_mask.to(device)
+    if not args.use_cache_text_encoder:
+        text_ids = text_ids.to(device)
+        text_mask = text_mask.to(device)
 
     # ======================================== Encode media ======================================
     # Used for 3D VAE with 2D inputs(image).
@@ -263,15 +279,16 @@ def prepare_model_inputs(
             )
 
         vae_dtype = PRECISION_TO_TYPE[args.vae_precision]
-        with torch.autocast(
-            device_type="cuda", dtype=vae_dtype, enabled=vae_dtype != torch.float32
-        ):
-            latents = vae.encode(media).latent_dist.sample()
-            if hasattr(vae.config, "shift_factor") and vae.config.shift_factor:
-                latents.sub_(vae.config.shift_factor).mul_(
-                    vae.config.scaling_factor)
-            else:
-                latents.mul_(vae.config.scaling_factor)
+        with torch.no_grad():
+            with torch.autocast(
+                device_type="cuda", dtype=vae_dtype, enabled=vae_dtype != torch.float32
+            ):
+                latents = vae.encode(media).latent_dist.sample()
+                if hasattr(vae.config, "shift_factor") and vae.config.shift_factor:
+                    latents.sub_(vae.config.shift_factor).mul_(
+                        vae.config.scaling_factor)
+                else:
+                    latents.mul_(vae.config.scaling_factor)
     elif len(latents.shape) == 5 or len(latents.shape) == 4:  # Using video/image cache
         latents = (
             latents * vae.config.scaling_factor
@@ -293,21 +310,23 @@ def prepare_model_inputs(
     # ======================================== Encode text ======================================
     # Autocast is handled by text_encoder itself.
     # Whether to apply text_mask is determined by args.use_attention_mask.
-    text_outputs = text_encoder.encode(
-        {"input_ids": text_ids, "attention_mask": text_mask},
-        data_type=batch_args[-1]["type"][0],
-        semantic_images=semantic_images,
-    )
-    text_states = text_outputs.hidden_state
-    text_mask = text_outputs.attention_mask
-    text_states_2 = (
-        text_encoder_2.encode(
-            {"input_ids": text_ids_2, "attention_mask": text_mask_2},
-            data_type=data_type,
-        ).hidden_state
-        if text_encoder_2 is not None
-        else None
-    )
+    if text_states is None or text_mask is None:
+        with torch.no_grad():
+            text_outputs = text_encoder.encode(
+                {"input_ids": text_ids, "attention_mask": text_mask},
+                data_type=batch_args[-1]["type"][0],
+                semantic_images=semantic_images,
+            )
+            text_states = text_outputs.hidden_state
+            text_mask = text_outputs.attention_mask
+            text_states_2 = (
+                text_encoder_2.encode(
+                    {"input_ids": text_ids_2, "attention_mask": text_mask_2},
+                    data_type=data_type,
+                ).hidden_state
+                if text_encoder_2 is not None
+                else None
+            )
 
     # ======================================== Build RoPE ======================================
     target_ndim = 3  # n-d RoPE
@@ -325,13 +344,16 @@ def prepare_model_inputs(
 
     # ===================================== Pack model kwargs ==================================
     model_kwargs = dict(
-        text_states=text_states,  # [b, 256, 4096]
+        text_states=text_states.to(dtype=model.dtype),  # [b, 256, 4096]
         text_mask=text_mask,  # [b, 256]
-        text_states_2=text_states_2,  # [b, 768]
+        text_states_2=text_states_2.to(dtype=model.dtype) if text_states_2 is not None else None,  # [b, 768]
         freqs_cos=freqs_cos,  # [seqlen, head_dim]
         freqs_sin=freqs_sin,  # [seqlen, head_dim]
         return_dict=True,
     )
+
+    latents = latents.to(dtype=model.dtype)
+    cond_latents = cond_latents.to(dtype=model.dtype)
 
     return latents, model_kwargs, freqs_cos.shape[0], cond_latents
 
@@ -401,3 +423,17 @@ def get_rope_freq_from_size(
 
     return freqs_cos, freqs_sin
 
+def get_training_output_dir(root_folder, name=None):
+    if name is not None:
+        output_dir = Path(root_folder) / name
+    else:
+        existing_dirs = [
+            d for d in os.listdir(root_folder)
+            if os.path.isdir(os.path.join(root_folder, d)) and d.startswith("run_")
+        ]
+        existing_indices = [
+            int(d.split("_")[1]) for d in existing_dirs if d.split("_")[1].isdigit()
+        ]
+        next_index = max(existing_indices, default=0) + 1
+        output_dir = Path(root_folder) / f"run_{next_index:05d}"
+    return output_dir
