@@ -23,8 +23,10 @@ from voyager.config import *
 from voyager.diffusion import load_denoiser
 from voyager.diffusion.flow import Transport
 from voyager.utils.train_utils import set_reproducibility, prepare_model_inputs, get_training_output_dir
+from voyager.utils.file_utils import save_videos_grid
 from voyager.inference import load_models
 from voyager.modules.lora_layers import apply_lora_to_hunyuan_video, get_lora_parameters, get_lora_state_dict, load_lora_state_dict
+from voyager.modules.custom_patch_embed import apply_patch_adapter_to_hunyuan_video, get_patch_adapter_parameters, get_patch_adapter_state_dict
 from voyager.constants import PRECISION_TO_TYPE
 from voyager.cache.text_cache import TextEncoderCache
 from gather_realestate import norm_partial_render_output
@@ -49,6 +51,7 @@ def parse_arg():
     parser.add_argument('--device', type=str, default='cuda', help='Device to use for training')
     parser.add_argument('--use-cache-text-encoder', action='store_true', help='Whether to cache text encoder outputs')
     parser.add_argument('--placeholder-row-length', type=int, default=64, help='Placeholder row length')
+    parser.add_argument('--train-lora', action='store_true', help='Whether to train LoRA adapters')
     parser.add_argument(
         '--resume-lora',
         type=str,
@@ -56,10 +59,18 @@ def parse_arg():
         help='Path to a LoRA checkpoint (.pt) to resume from',
     )
     parser.add_argument(
-        '--save-lora-every',
+        '--save-every',
         type=int,
         default=1000,
-        help='Save LoRA checkpoint every N effective steps (after grad accumulation).',
+        help='Save checkpoint every N effective steps (after grad accumulation).',
+    )
+    parser.add_argument(
+        "--patch_adapter_size",
+        type=int,
+        nargs="+",
+        default=None,
+        help="New patch size for PatchEmbed/FinalLayer (pt ph pw). "
+            "If None, use pretrained patch size.",
     )
     parser.add_argument(
         '--num-workers-render',
@@ -78,6 +89,7 @@ def parse_arg():
     parser = add_extra_models_args(parser)
     parser = add_denoise_schedule_args(parser)
     parser = add_lora_args(parser)
+    parser = add_patch_adapter_args(parser)
 
     args = parser.parse_args()
     return args
@@ -224,6 +236,29 @@ def save_lora_checkpoint(model_engine, args, epoch, step, training_output_dir):
             print(f"Saving LoRA checkpoint to {ckpt_path}")
             torch.save(ckpt, ckpt_path)
 
+def save_patch_adapter_checkpoint(model_engine, args, epoch, step, training_output_dir):
+    """
+    Gather and save only patch-adapter parameters (PatchEmbed + FinalLayer)
+    from a ZeRO-sharded DeepSpeed engine.
+    """
+
+    patch_params = get_patch_adapter_parameters(model_engine.module)
+
+    # Gather unsharded weights on rank 0 only
+    with deepspeed.zero.GatheredParameters(patch_params, modifier_rank=0):
+        if dist.get_rank() == 0:
+            patch_sd = get_patch_adapter_state_dict(model_engine.module)
+            ckpt = {
+                "epoch": epoch,
+                "step_in_epoch": step,
+                "patch_adapter": patch_sd,
+                "args": vars(args),
+            }
+            ckpt_path = Path(training_output_dir) / "patch_adapter_last.pt"
+            print(f"Saving PatchAdapter checkpoint to {ckpt_path}")
+            torch.save(ckpt, ckpt_path)
+
+
 if __name__ == "__main__":
     args = parse_arg()
     print(args)
@@ -269,26 +304,35 @@ if __name__ == "__main__":
     else:
         logger.info("Loading text encoder cache...")
         text_encoder_cache = TextEncoderCache(Path(args.dataset_root) / "cache" / "text_encoder")
-    apply_lora_to_hunyuan_video(
-        model,
-        r=args.lora_rank if hasattr(args, "lora_rank") else 8,
-        lora_alpha=args.lora_alpha if hasattr(args, "lora_alpha") else 16.0,
-        lora_dropout=getattr(args, "lora_dropout", 0.0),
-        freeze_base=True,
-    )
+    if args.train_lora:
+        logger.info("Applying LoRA adapters to model...")
+        apply_lora_to_hunyuan_video(
+            model,
+            r=args.lora_rank if hasattr(args, "lora_rank") else 8,
+            lora_alpha=args.lora_alpha if hasattr(args, "lora_alpha") else 16.0,
+            lora_dropout=getattr(args, "lora_dropout", 0.0),
+            freeze_base=True,
+        )
+    if args.patch_adapter_size is not None:
+        logger.info(f"Applying Patch Size Adapters with new patch size: {args.patch_adapter_size}")
+        apply_patch_adapter_to_hunyuan_video(
+            model,
+            new_patch_size=tuple(args.patch_adapter_size),
+            freeze_base=True,
+        )
 
+    lora_params = get_lora_parameters(model) if args.train_lora else []
+    patch_params = get_patch_adapter_parameters(model) if args.patch_adapter_size is not None else []
+    trainable_params = lora_params + patch_params
+    for p in trainable_params:
+        p.requires_grad = True
+    
     # log model's trainable params
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info(f"Total parameters: {total_params}")
-    logger.info(f"Trainable parameters: {trainable_params}")
-
-    lora_params = get_lora_parameters(model)
-    optimizer = build_optimizer(lora_params, args)
-
-    sd = model.state_dict()
-    print("Current LoRA shape:",
-        sd["single_blocks.0.linear2.lora_A"].shape)
+    total_params_cnt = sum(p.numel() for p in model.parameters())
+    trainable_params_cnt = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"Total parameters: {total_params_cnt}")
+    logger.info(f"Trainable parameters: {trainable_params_cnt}")
+    optimizer = build_optimizer(trainable_params, args)
 
     start_epoch = 0
     start_step_in_epoch = -1
@@ -296,9 +340,6 @@ if __name__ == "__main__":
     if args.resume_lora is not None and os.path.isfile(args.resume_lora):
         logger.info(f"Resuming LoRA from {args.resume_lora}")
         ckpt = torch.load(args.resume_lora, map_location='cpu', weights_only=False)
-
-        print("Checkpoint LoRA shape:",
-            ckpt["lora"]["single_blocks.0.linear2.lora_A"].shape)
 
         # Load LoRA weights into the wrapped model
         load_lora_state_dict(model, ckpt["lora"], strict=False)
@@ -333,8 +374,8 @@ if __name__ == "__main__":
     loss_values = []
     avg_loss_values = []
     start_time = time.time()
+    running_loss = 0.0
     for epoch in range(start_epoch, args.epochs):
-        running_loss = 0.0
         pbar = tqdm(enumerate(dataloader), desc=f"Epoch {epoch + 1}")
         for step, data in pbar:
             # update desc, print hour, minute, second
@@ -405,6 +446,27 @@ if __name__ == "__main__":
                                                                     (args, batch, args.device, \
                                                                     model_engine.module, vae, text_encoder, text_encoder_2,\
                                                                     args.rope_theta_rescale_factor, args.rope_interpolation_factor)
+            
+            # # DEBUG
+            # with torch.autocast(
+            #     device_type="cuda", dtype=vae.dtype, enabled=True
+            # ):
+            #     image = vae.decode(latents / vae.config.scaling_factor)[0]
+            # if image.shape[2] == 1:
+            #     image = image.squeeze(2)
+            # logger.info(f"Reconstructed rgb_depths from latents with shape {image.shape}")
+            # image = (image / 2 + 0.5).clamp(0, 1)
+            # image = image.cpu().float()
+            # half_height = args.height
+            # rgb = image[..., :half_height, :]
+            # depth = image[..., -half_height:, :]
+            # depth = depth[:, 0] * 0.299 + depth[:, 1] * 0.587 + depth[:, 2] * 0.114
+            # depth = depth.unsqueeze(1).repeat(1, 3, 1, 1, 1)
+            # image = torch.cat([rgb, depth], dim=-2)
+            # logger.info(f"Reconstructed rgb shape: {rgb.shape}, depth shape: {depth.shape}")
+            # save_videos_grid(image, "/raid/hvtham/ldnhuan/HunyuanWorld-Voyager/debug.mp4", fps=24)
+            # # END DEBUG
+
             loss = training_step(
                 latents,
                 cond_latents,
@@ -428,11 +490,11 @@ if __name__ == "__main__":
                 if (global_step + 1) % steps_per_update == 0:
                     avg_loss = running_loss / steps_per_update
                     avg_loss_values.append({
-                        'step': global_step,
+                        'step': global_step + 1,
                         'avg_loss': avg_loss,
                         'time': datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
                     })
-                    logger.info(f"[Update {(global_step+1)//steps_per_update}] avg_loss = {avg_loss:.4f}")
+                    logger.info(f"[Update {(global_step + 1) // steps_per_update}] avg_loss = {avg_loss:.4f}")
                     running_loss = 0.0                                     
                     with open(Path(training_output_dir) / 'loss_log.json', 'w') as f:
                         json.dump({'loss_values': loss_values, 'avg_loss_values': avg_loss_values}, f, indent=4)
@@ -444,11 +506,19 @@ if __name__ == "__main__":
                     plt.savefig(Path(training_output_dir) / 'avg_loss_curve.png')
                     plt.close()
 
-                    if args.save_lora_every > 0 and (global_step % args.save_lora_every == 0):
-                        ckpt_path = Path(training_output_dir) / f"lora_last.pt"
-                        logger.info(f"Saving LoRA checkpoint to {ckpt_path}")
-                        save_lora_checkpoint(model_engine, args, epoch, step, training_output_dir)
+                    effective_update = (global_step + 1) // steps_per_update
+
+                    if args.save_every > 0 and (effective_update % args.save_every == 0):
+                        if args.train_lora:
+                            lora_ckpt_path = Path(training_output_dir) / f"lora_last.pt"
+                            logger.info(f"Saving LoRA checkpoint to {lora_ckpt_path}")
+                            save_lora_checkpoint(model_engine, args, epoch, step, training_output_dir)
+                        if args.patch_adapter_size is not None:
+                            patch_adapter_ckpt_path = Path(training_output_dir) / f"patch_adapter_last.pt"
+                            logger.info(f"Saving PatchAdapter checkpoint to {patch_adapter_ckpt_path}")
+                            save_patch_adapter_checkpoint(model_engine, args, epoch, step, training_output_dir)
 
                 print(f"{latents.shape=}")
                 print(f"{cond_latents.shape=}")
                 print(f"{n_tokens=}")
+            

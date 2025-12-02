@@ -28,6 +28,13 @@ def parse_args(mode="eval", namespace=None):
     parser = add_lora_args(parser)
     parser = add_inference_args(parser)
     parser = add_parallel_args(parser)
+    parser = add_patch_adapter_args(parser)
+    
+    if "eval_realestate10K" in mode:
+        parser = add_realestate10K_eval_args(parser)
+    
+    if mode == 'eval_realestate10K_fill':
+        parser = add_condition_filling_args(parser)
     
     # Add training-specific arguments if in training mode
     if mode == "train":
@@ -41,6 +48,58 @@ def parse_args(mode="eval", namespace=None):
     args = sanity_check_args(args)
 
     return args
+
+def add_realestate10K_eval_args(parser: argparse.ArgumentParser):
+    """Add RealEstate10K evaluation-specific arguments
+    
+    These arguments configure the evaluation process on the RealEstate10K dataset,
+    including dataset paths and output directories.
+    """
+    group = parser.add_argument_group(title="RealEstate10K Evaluation args")
+
+    group.add_argument(
+        "--dataset-path",
+        type=str,
+        default="dataset/RealEstate10K/refined_test_150",
+        help="Path to the RealEstate10K dataset for evaluation.",
+    )
+    group.add_argument(
+        "--output-path",
+        type=str,
+        required=True,
+        help="Path to save evaluation results.",
+    )
+    group.add_argument(
+        "--first-clean-frame",
+        action="store_true",
+        help="Whether to use the first clean frame for evaluation.",
+    )
+    return parser
+
+def add_condition_filling_args(parser: argparse.ArgumentParser):
+    """Add condition filling arguments for training/inference
+    
+    These arguments configure the condition filling process,
+    including mask types and filling strategies.
+    """
+    group = parser.add_argument_group(title="Condition filling args")
+
+    group.add_argument(
+        "--fill-dataset-path",
+        type=str,
+        required=True,
+        help="Path to the dataset for condition filling.",
+    )
+
+    group.add_argument(
+        "--fill-video-size",
+        type=int,
+        nargs="+",
+        default=(256, 384),
+        help="Video size for condition filling. If a single value is provided, it will be used for both height and width. If two values are provided, they will be used for height and width respectively.",
+    )
+
+    return parser
 
 
 def add_train_denoise_schedule_args(parser: argparse.ArgumentParser):
@@ -691,6 +750,24 @@ def add_lora_args(parser: argparse.ArgumentParser):
 
     group.add_argument(
         "--lora-rank", type=int, default=64, help="Rank for lora model."
+    )
+
+    return parser
+
+def add_patch_adapter_args(parser: argparse.ArgumentParser):
+    """Add Patch Adapter arguments
+    
+    These arguments configure Patch Adapter fine-tuning,
+    which allows efficient adaptation of large models with minimal parameter updates.
+    """
+    group = parser.add_argument_group(title="Patch Adapter args")
+
+    group.add_argument(
+        "--use-patch-adapter", action="store_true", help="Whether to open patch adapter mode."
+    )
+
+    group.add_argument(
+        "--patch-adapter-path", type=str, default="", help="Weight path for patch adapter model."
     )
 
     return parser

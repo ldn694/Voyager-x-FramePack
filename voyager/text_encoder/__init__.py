@@ -13,6 +13,7 @@ from transformers import (
     CLIPImageProcessor,
 )
 from transformers.utils import ModelOutput
+from torch.nn.utils.rnn import pad_sequence
 
 from ..constants import TEXT_ENCODER_PATH, TOKENIZER_PATH
 from ..constants import PRECISION_TO_TYPE
@@ -494,8 +495,10 @@ class TextEncoder(nn.Module):
                         else None
                     )
 
-                text_last_hidden_state = torch.stack(text_last_hidden_state)
-                text_attention_mask = torch.stack(text_attention_mask)
+                # text_last_hidden_state = torch.stack(text_last_hidden_state)
+                # text_attention_mask = torch.stack(text_attention_mask)
+                text_last_hidden_state = pad_sequence(text_last_hidden_state, batch_first=True, padding_value=0.0)
+                text_attention_mask = pad_sequence(text_attention_mask, batch_first=True, padding_value=0) if use_attention_mask else None
                 image_last_hidden_state = torch.stack(image_last_hidden_state)
                 image_attention_mask = torch.stack(image_attention_mask)
 

@@ -149,17 +149,17 @@ def apply_lora_to_hunyuan_video(
         for p in model.parameters():
             p.requires_grad = False
 
-        for module in model.modules():
-            if isinstance(module, LoRALinear):
-                # base weight/bias frozen
-                module.weight.requires_grad = False
-                if module.bias is not None:
-                    module.bias.requires_grad = False
-                # LoRA matrices trainable
-                if module.lora_A is not None:
-                    module.lora_A.requires_grad = True
-                if module.lora_B is not None:
-                    module.lora_B.requires_grad = True
+    for module in model.modules():
+        if isinstance(module, LoRALinear):
+            # base weight/bias frozen
+            module.weight.requires_grad = False
+            if module.bias is not None:
+                module.bias.requires_grad = False
+            # LoRA matrices trainable
+            if module.lora_A is not None:
+                module.lora_A.requires_grad = True
+            if module.lora_B is not None:
+                module.lora_B.requires_grad = True
 
 
 def get_lora_parameters(model: nn.Module):

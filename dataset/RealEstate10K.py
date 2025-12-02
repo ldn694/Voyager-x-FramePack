@@ -42,12 +42,16 @@ class RealEstate10K(Dataset):
         self.depth_path = os.path.join(self.root_path, 'depth_videos')
         self.depth_ranges_path = os.path.join(self.root_path, 'depth_ranges')
         self.cameras_path = os.path.join(self.root_path, 'cameras')
+        self.caption_path = os.path.join(self.root_path, 'train_caption.json')
         self.folder_path = os.path.join(self.root_path, self.set_name)
         self.width = width
         self.height = height
 
         self.media_files = glob.glob(os.path.join(self.folder_path, '*.txt'))
         self.data = []
+
+        with open(self.caption_path, 'r') as f:
+            self.captions = json.load(f)
 
         for media_file in tqdm.tqdm(self.media_files, desc="Loading media files"):
             # Read media file to get video path and timestamps
@@ -103,13 +107,19 @@ class RealEstate10K(Dataset):
                 'depth_range': (depth_ranges[i]['min_inverse_depth'], depth_ranges[i]['max_inverse_depth']),
                 'frame_index': i,
             } for i in range(len(timestamps))]
-
+            sample_id = os.path.basename(media_file).split('.')[0]
+            prompt = self.captions.get(sample_id, "").split(";")
+            if len(prompt) == 0:
+                prompt == ""
+            else:
+                prompt = prompt[0].strip()
             self.data.append({
-                'sample_id': os.path.basename(media_file).split('.')[0],
+                'sample_id': sample_id,
                 'video_id': video_id,
                 'frame_infos': frame_infos,
                 'rgb_folder': rgb_folder,
                 'depth_video_file': depth_video_file,
+                'prompt': prompt,
             })
         print(f"Loaded {len(self.data)} samples from {self.set_name} set.")
     
@@ -149,6 +159,7 @@ class RealEstate10K(Dataset):
         frame_infos = self.data[index]['frame_infos']
         rgb_folder = self.data[index]['rgb_folder']
         depth_video_file = self.data[index]['depth_video_file']
+        prompt = self.data[index]['prompt']
 
         viable = sorted([iv for iv in self.frames_intervals
                         if len(frame_infos) >= 1 + (self.frame_per_sample - 1) * iv])
@@ -289,7 +300,8 @@ class RealEstate10K(Dataset):
             'rgb': images,          # (3, T, H, W)
             'depth': depth_tensor,  # (1, T, H, W)
             'intrinsic': intrinsics,  # (T, 3, 3)
-            'w2c': w2c,               # (T, 4, 4)
+            'w2c': w2c,               # (T, 4, 4),
+            'prompt': prompt, # (str)
         }
     def __repr__(self):
         return f"RealEstate10K(dataset='{self.set_name}', num_samples={len(self)})"
