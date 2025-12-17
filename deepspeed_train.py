@@ -27,10 +27,12 @@ from voyager.utils.file_utils import save_videos_grid
 from voyager.inference import load_models
 from voyager.modules.lora_layers import apply_lora_to_hunyuan_video, get_lora_parameters, get_lora_state_dict, load_lora_state_dict
 from voyager.modules.custom_patch_embed import apply_patch_adapter_to_hunyuan_video, get_patch_adapter_parameters, get_patch_adapter_state_dict
+from voyager.modules.multi_kernel import apply_multikernel_to_hunyuan_video, get_multikernel_parameters, get_multikernel_state_dict
 from voyager.constants import PRECISION_TO_TYPE
 from voyager.cache.text_cache import TextEncoderCache
 from gather_realestate import norm_partial_render_output
 from utils.render import Camera, Frame
+from voyager.utils.helpers import as_list_of_3tuple
 
 def build_optimizer(param, args):
     optimizer = DeepSpeedCPUAdam(
@@ -78,6 +80,28 @@ def parse_arg():
         default=10,
         help='Number of worker threads for rendering',
     )
+    parser.add_argument(
+        '--cache-model-input',
+        action='store_true',
+        help='Whether to cache model inputs during training for faster loading',
+    )
+    parser.add_argument(
+        '--train-multiple-kernels',
+        action='store_true',
+        help='Whether to train multiple patchify kernels',
+    )
+    parser.add_argument(
+        "--kernel-sizes",
+        action="append",      # collect multiple occurrences
+        nargs="+",            # accept multiple ints per occurrence
+        type=int
+    )
+    parser.add_argument(
+        "--kernel-indices",
+        action="append",      # collect multiple occurrences
+        nargs="+",            # accept multiple ints per occurrence
+        type=int
+    )
     parser = add_inference_args(parser)
     parser = add_training_args(parser)
     parser = add_optimizer_args(parser)
@@ -90,8 +114,10 @@ def parse_arg():
     parser = add_denoise_schedule_args(parser)
     parser = add_lora_args(parser)
     parser = add_patch_adapter_args(parser)
+    parser = add_multiple_kernel_args(parser)
 
     args = parser.parse_args()
+    args.kernel_sizes = as_list_of_3tuple(args.kernel_sizes) if args.kernel_sizes is not None else None
     return args
 
 def training_step(
@@ -213,6 +239,26 @@ def render(frames, shape, args, partial_rendering=False):
 
     return rgb_depths, masks
 
+def save_full_model_checkpoint(model_engine, args, epoch, step, training_output_dir):
+    # Gather full (unsharded) model weights on rank 0
+    # NOTE: modifier_rank=0 means rank 0 owns the gathered tensors
+    with deepspeed.zero.GatheredParameters(model_engine.module.parameters(), modifier_rank=0):
+        if dist.get_rank() == 0:
+            # Now the underlying tensors are full-sized on rank 0,
+            # so state_dict() will contain non-empty tensors.
+            full_model_sd = model_engine.module.state_dict()
+
+            ckpt = {
+                "epoch": epoch,
+                "step_in_epoch": step,
+                "model": full_model_sd,
+                "args": vars(args),
+            }
+
+            ckpt_path = Path(training_output_dir) / f"model_{args.model.replace('/', '_')}_last.pt"
+            logger.info(f"Saving full model checkpoint to {ckpt_path}")
+            torch.save(ckpt, ckpt_path)
+
 def save_lora_checkpoint(model_engine, args, epoch, step, training_output_dir):
     # Collect the LoRA params list (same as you pass to optimizer)
     lora_params = get_lora_parameters(model_engine.module)
@@ -258,6 +304,28 @@ def save_patch_adapter_checkpoint(model_engine, args, epoch, step, training_outp
             print(f"Saving PatchAdapter checkpoint to {ckpt_path}")
             torch.save(ckpt, ckpt_path)
 
+def save_multi_kernel_checkpoint(model_engine, args, epoch, step, training_output_dir):
+    """
+    Gather and save only multi-kernel parameters (MultiPatchEmbed + MultiFinalLayer)
+    from a ZeRO-sharded DeepSpeed engine.
+    """
+
+    # Collect the multi-kernel params list (same as you pass to optimizer)
+    multi_kernel_params = get_multikernel_parameters(model_engine.module)
+
+    # Gather unsharded weights on rank 0 only
+    with deepspeed.zero.GatheredParameters(multi_kernel_params, modifier_rank=0):
+        if dist.get_rank() == 0:
+            multi_kernel_sd = get_multikernel_state_dict(model_engine.module)
+            ckpt = {
+                "epoch": epoch,
+                "step_in_epoch": step,
+                "multi_kernel": multi_kernel_sd,
+                "args": vars(args),
+            }
+            ckpt_path = Path(training_output_dir) / "multi_kernel_last.pt"
+            print(f"Saving Multi-Kernel checkpoint to {ckpt_path}")
+            torch.save(ckpt, ckpt_path)
 
 if __name__ == "__main__":
     args = parse_arg()
@@ -294,7 +362,7 @@ if __name__ == "__main__":
 
     logger.info("Building model...")
     model, vae, text_encoder, text_encoder_2, vae_kwargs = \
-        load_models(args, args.device, logger, Path(args.model_base))
+        load_models(args, args.device, logger, Path(args.model_base) if args.model_base is not None else None)
     vae.enable_tiling()
     vae.eval()
     if not args.use_cache_text_encoder:
@@ -311,21 +379,47 @@ if __name__ == "__main__":
             r=args.lora_rank if hasattr(args, "lora_rank") else 8,
             lora_alpha=args.lora_alpha if hasattr(args, "lora_alpha") else 16.0,
             lora_dropout=getattr(args, "lora_dropout", 0.0),
-            freeze_base=True,
+            freeze_base=not args.train_from_scratch
         )
     if args.patch_adapter_size is not None:
         logger.info(f"Applying Patch Size Adapters with new patch size: {args.patch_adapter_size}")
         apply_patch_adapter_to_hunyuan_video(
             model,
             new_patch_size=tuple(args.patch_adapter_size),
-            freeze_base=True,
+            freeze_base=not args.train_from_scratch,
+        )
+    if args.train_multiple_kernels:
+        if args.kernel_sizes is None or args.kernel_indices is None:
+            raise ValueError("When using --train-multiple-kernels, you must also provide --kernel-sizes and --kernel-indices")
+        if len(args.kernel_sizes) != len(args.kernel_indices):
+            raise ValueError("The number of --kernel-sizes entries must match the number of --kernel-indices entries")
+        patch_sizes = [tuple(ks) for ks in args.kernel_sizes]
+        kernel_indices = [list(ki) for ki in args.kernel_indices]
+        logger.info(f"Applying Multi-Kernel with patch sizes: {patch_sizes} and indices: {kernel_indices}")
+        apply_multikernel_to_hunyuan_video(
+            model,
+            patch_sizes=patch_sizes,
+            device=args.device,
+            dtype=dtype,
+            freeze_base=not args.train_from_scratch,
         )
 
     lora_params = get_lora_parameters(model) if args.train_lora else []
     patch_params = get_patch_adapter_parameters(model) if args.patch_adapter_size is not None else []
-    trainable_params = lora_params + patch_params
-    for p in trainable_params:
+    multikernel_params = get_multikernel_parameters(model) if args.train_multiple_kernels else []
+    logger.info(f"Number of LoRA parameters: {sum(p.numel() for p in lora_params)}")
+    logger.info(f"Number of Patch Adapter parameters: {sum(p.numel() for p in patch_params)}")
+    logger.info(f"Number of Multi-Kernel parameters: {sum(p.numel() for p in multikernel_params)}")
+    
+    trainable_addons_params = lora_params + patch_params + multikernel_params
+    for p in trainable_addons_params:
         p.requires_grad = True
+    
+    # get all trainable parameters in model, add into trainable_params
+    trainable_params = []
+    for p in model.parameters():
+        if p.requires_grad:
+            trainable_params.append(p)
     
     # log model's trainable params
     total_params_cnt = sum(p.numel() for p in model.parameters())
@@ -370,6 +464,12 @@ if __name__ == "__main__":
     steps_per_update = model_engine.gradient_accumulation_steps()
     logger.info(f"Grad accumulation steps: {steps_per_update}")
 
+    #===================PREPARE MODEL INPUT CACHE===================#
+    if args.cache_model_input:
+        logger.info("Preparing model input cache...")
+        model_input_cache = []
+        model_input_map = {}
+    
     #===================TRAINING LOOP===================#
     loss_values = []
     avg_loss_values = []
@@ -394,78 +494,171 @@ if __name__ == "__main__":
             # Prepare parital cond
             frames = []
             B, _, T, H, W = rgbs.shape
-            for b in range(B):
-                frames.append([Frame(
-                    rgb=ToPILImage()(rgbs[b, :, i]),
-                    depth=inverse_depths[b, 0, i].numpy(),
-                    camera=Camera(intrinsics[b, i].numpy(), w2cs[b, i].numpy()),
-                    is_reverse_depth=True,
-                ) for i in range(T)
-                ])
-            # Compute ground truth media
-            logger.info("Rendering ground truth rgb and depth...")
-            ground_truth_rgb_depths, _ = render(frames, rgbs.shape, args, partial_rendering=False)
-            ground_truth_rgb_depths = ground_truth_rgb_depths.to(model_engine.module.dtype)
-            # Compute partial cond
-            logger.info("Rendering partial cond rgb and depth...")
-            partial_rgb_depths, partial_mask = render(frames, rgbs.shape, args, partial_rendering=True)
-            # Encode partial cond to latent space
-            partial_rgb_depths = partial_rgb_depths.to(vae.dtype).to(args.device)
-            logger.info(f"Encoding partial cond with shape {partial_rgb_depths.shape} to latent space...")
-            partial_cond = vae.encode(
-                    partial_rgb_depths).latent_dist.sample()
-            partial_cond.mul_(vae.config.scaling_factor)
-            partial_cond = partial_cond.to(model_engine.module.dtype)
-            # Invert the mask
-            partial_mask = 1 - partial_mask
-            first_mask = partial_mask[:, :, 0:1, :, :]  # (B, 3, 1, H*2 + placeholder_row_length, W)
-            partial_mask = torch.cat([first_mask, first_mask, first_mask, partial_mask], dim=2)  # (B, 3, T, H*2 + placeholder_row_length, W)
-            partial_mask = torch.nn.functional.max_pool3d(
-                partial_mask, kernel_size=(4, 8, 8), stride=(4, 8, 8)
-            )
-            # Invert the mask again
-            partial_mask = 1 - partial_mask
-            partial_mask = partial_mask[: , 0:1].to(model_engine.module.dtype)
+        
+            cached = False
+
+            if args.cache_model_input:
+                logger.info("Cache model input is enable, checking cache...")
+                all_in_cache = True
+                for b in range(B):
+                    model_input_map_key = sample_id[b]
+                    if model_input_map_key not in model_input_map:
+                        all_in_cache = False
+                        break
+                if all_in_cache:
+                    logger.info("All samples in cache, loading from cache...")
+                    # Load from cache
+                    latents_list = []
+                    text_states_list = []
+                    text_mask_list = []
+                    text_states_2_list = []
+                    freqs_cos = None
+                    freqs_sin = None
+                    indices = None
+                    n_tokens = None
+                    cond_latents_list = []
+                    for b in range(B):
+                        model_input_map_key = sample_id[b]
+                        cache_idx = model_input_map[model_input_map_key]
+                        (
+                            latents_b,
+                            text_states_b,
+                            text_mask_b,
+                            text_states_2_b,
+                            freqs_cos_b,
+                            freqs_sin_b,
+                            indices_b,
+                            n_tokens,
+                            cond_latents_b,
+                        ) = model_input_cache[cache_idx]
+                        latents_list.append(latents_b.to(model_engine.module.dtype).to(args.device))
+                        text_states_list.append(text_states_b.to(model_engine.module.dtype).to(args.device))
+                        text_mask_list.append(text_mask_b.to(args.device))
+                        text_states_2_list.append(text_states_2_b.to(model_engine.module.dtype).to(args.device))
+                        if freqs_cos is None:
+                            freqs_cos = freqs_cos_b.to(model_engine.module.dtype).to(args.device)
+                        else:
+                            assert torch.allclose(freqs_cos, freqs_cos_b)
+                        if freqs_sin is None:
+                            freqs_sin = freqs_sin_b.to(model_engine.module.dtype).to(args.device)
+                        else:
+                            assert torch.allclose(freqs_sin, freqs_sin_b)
+                        if indices is None:
+                            indices = indices_b
+                        else:
+                            assert indices == indices_b                            
+                        cond_latents_list.append(cond_latents_b.to(model_engine.module.dtype).to(args.device))
+                    latents = torch.cat(latents_list, dim=0)
+                    model_kwargs = {
+                        'text_states': torch.cat(text_states_list, dim=0),
+                        'text_mask': torch.cat(text_mask_list, dim=0),
+                        'text_states_2': torch.cat(text_states_2_list, dim=0),
+                        'freqs_cos': freqs_cos,
+                        'freqs_sin': freqs_sin,
+                        'indices': indices,
+                    }
+                    cond_latents = torch.cat(cond_latents_list, dim=0)
+                    logger.info(f"Loaded model inputs from cache with latents shape {latents.shape}, cond_latents shape {cond_latents.shape}")
+                    cached = True
+                else:
+                    logger.info("Some samples not in cache...")
+            if not cached:
+                logger.info("Computing model inputs...")
+                for b in range(B):
+                    frames.append([Frame(
+                        rgb=ToPILImage()(rgbs[b, :, i]),
+                        depth=inverse_depths[b, 0, i].numpy(),
+                        camera=Camera(intrinsics[b, i].numpy(), w2cs[b, i].numpy()),
+                        is_reverse_depth=True,
+                    ) for i in range(T)
+                    ])
+                # Compute ground truth media
+                logger.info("Rendering ground truth rgb and depth...")
+                ground_truth_rgb_depths, _ = render(frames, rgbs.shape, args, partial_rendering=False)
+                ground_truth_rgb_depths = ground_truth_rgb_depths.to(model_engine.module.dtype)
+                # Compute partial cond
+                logger.info("Rendering partial cond rgb and depth...")
+                partial_rgb_depths, partial_mask = render(frames, rgbs.shape, args, partial_rendering=True)
+                # Encode partial cond to latent space
+                partial_rgb_depths = partial_rgb_depths.to(vae.dtype).to(args.device)
+                logger.info(f"Encoding partial cond with shape {partial_rgb_depths.shape} to latent space...")
+                partial_cond = vae.encode(
+                        partial_rgb_depths).latent_dist.sample()
+                partial_cond.mul_(vae.config.scaling_factor)
+                partial_cond = partial_cond.to(model_engine.module.dtype)
+                # Invert the mask
+                partial_mask = 1 - partial_mask
+                first_mask = partial_mask[:, :, 0:1, :, :]  # (B, 3, 1, H*2 + placeholder_row_length, W)
+                partial_mask = torch.cat([first_mask, first_mask, first_mask, partial_mask], dim=2)  # (B, 3, T, H*2 + placeholder_row_length, W)
+                partial_mask = torch.nn.functional.max_pool3d(
+                    partial_mask, kernel_size=(4, 8, 8), stride=(4, 8, 8)
+                )
+                # Invert the mask again
+                partial_mask = 1 - partial_mask
+                partial_mask = partial_mask[: , 0:1].to(model_engine.module.dtype)
 
 
-            if text_encoder_cache is None:
-                text_inputs = text_encoder.text2tokens(prompt)
-                text_ids_1 = text_inputs['input_ids'].to(args.device)
-                text_mask_1 = text_inputs['attention_mask'].to(args.device)
-                text_inputs = text_encoder_2.text2tokens(prompt)
-                text_ids_2 = text_inputs['input_ids'].to(args.device)
-                text_mask_2 = text_inputs['attention_mask'].to(args.device)
-                batch = (ground_truth_rgb_depths, torch.tensor([0]), text_ids_1, text_mask_1, text_ids_2, text_mask_2, {"type": ["video"]})
-            else:
-                llm_i2v_text_states, llm_i2v_text_masks = text_encoder_cache.get_llm_i2v_text_state_and_mask(sample_id)
-                llm_i2v_text_states = llm_i2v_text_states.to(args.device).to(model_engine.module.dtype)
-                llm_i2v_text_masks = llm_i2v_text_masks.to(args.device)
-                clipl_text_states = text_encoder_cache.get_clipl_text_state(sample_id).to(args.device).to(model_engine.module.dtype)
-                batch = (ground_truth_rgb_depths, torch.tensor([0]), llm_i2v_text_states, llm_i2v_text_masks, clipl_text_states, {"type": ["video"]})
-            latents, model_kwargs, n_tokens, cond_latents = prepare_model_inputs \
-                                                                    (args, batch, args.device, \
-                                                                    model_engine.module, vae, text_encoder, text_encoder_2,\
-                                                                    args.rope_theta_rescale_factor, args.rope_interpolation_factor)
+                if text_encoder_cache is None:
+                    text_inputs = text_encoder.text2tokens(prompt)
+                    text_ids_1 = text_inputs['input_ids'].to(args.device)
+                    text_mask_1 = text_inputs['attention_mask'].to(args.device)
+                    text_inputs = text_encoder_2.text2tokens(prompt)
+                    text_ids_2 = text_inputs['input_ids'].to(args.device)
+                    text_mask_2 = text_inputs['attention_mask'].to(args.device)
+                    batch = (ground_truth_rgb_depths, torch.tensor([0]), text_ids_1, text_mask_1, text_ids_2, text_mask_2, {"type": ["video"]})
+                else:
+                    llm_i2v_text_states, llm_i2v_text_masks = text_encoder_cache.get_llm_i2v_text_state_and_mask(sample_id)
+                    llm_i2v_text_states = llm_i2v_text_states.to(args.device).to(model_engine.module.dtype)
+                    llm_i2v_text_masks = llm_i2v_text_masks.to(args.device)
+                    clipl_text_states = text_encoder_cache.get_clipl_text_state(sample_id).to(args.device).to(model_engine.module.dtype)
+                    batch = (ground_truth_rgb_depths, torch.tensor([0]), llm_i2v_text_states, llm_i2v_text_masks, clipl_text_states, {"type": ["video"]})
+                latents, model_kwargs, n_tokens, cond_latents = prepare_model_inputs \
+                                                                        (args, batch, args.device, \
+                                                                        model_engine.module, vae, text_encoder, text_encoder_2,\
+                                                                        args.rope_theta_rescale_factor, args.rope_interpolation_factor)
+                logger.info(f"Computed model inputs with latents shape {latents.shape}, cond_latents shape {cond_latents.shape}")
             
-            # # DEBUG
-            # with torch.autocast(
-            #     device_type="cuda", dtype=vae.dtype, enabled=True
-            # ):
-            #     image = vae.decode(latents / vae.config.scaling_factor)[0]
-            # if image.shape[2] == 1:
-            #     image = image.squeeze(2)
-            # logger.info(f"Reconstructed rgb_depths from latents with shape {image.shape}")
-            # image = (image / 2 + 0.5).clamp(0, 1)
-            # image = image.cpu().float()
-            # half_height = args.height
-            # rgb = image[..., :half_height, :]
-            # depth = image[..., -half_height:, :]
-            # depth = depth[:, 0] * 0.299 + depth[:, 1] * 0.587 + depth[:, 2] * 0.114
-            # depth = depth.unsqueeze(1).repeat(1, 3, 1, 1, 1)
-            # image = torch.cat([rgb, depth], dim=-2)
-            # logger.info(f"Reconstructed rgb shape: {rgb.shape}, depth shape: {depth.shape}")
-            # save_videos_grid(image, "/raid/hvtham/ldnhuan/HunyuanWorld-Voyager/debug.mp4", fps=24)
-            # # END DEBUG
+                # # DEBUG
+                # with torch.autocast(
+                #     device_type="cuda", dtype=vae.dtype, enabled=True
+                # ):
+                #     image = vae.decode(latents / vae.config.scaling_factor)[0]
+                # if image.shape[2] == 1:
+                #     image = image.squeeze(2)
+                # logger.info(f"Reconstructed rgb_depths from latents with shape {image.shape}")
+                # image = (image / 2 + 0.5).clamp(0, 1)
+                # image = image.cpu().float()
+                # half_height = args.height
+                # rgb = image[..., :half_height, :]
+                # depth = image[..., -half_height:, :]
+                # depth = depth[:, 0] * 0.299 + depth[:, 1] * 0.587 + depth[:, 2] * 0.114
+                # depth = depth.unsqueeze(1).repeat(1, 3, 1, 1, 1)
+                # image = torch.cat([rgb, depth], dim=-2)
+                # logger.info(f"Reconstructed rgb shape: {rgb.shape}, depth shape: {depth.shape}")
+                # save_videos_grid(image, "/raid/hvtham/ldnhuan/HunyuanWorld-Voyager/debug.mp4", fps=24)
+                # # END DEBUG
+
+            if args.cache_model_input:
+                logger.info("Updating model input cache...")
+                for b in range(B):
+                    model_input_map_key = sample_id[b]
+                    if model_input_map_key in model_input_map:
+                        continue
+                    model_input_cache.append((
+                        latents[b:b+1].cpu(),
+                        model_kwargs['text_states'][b:b+1].cpu(),
+                        model_kwargs['text_mask'][b:b+1].cpu(),
+                        model_kwargs['text_states_2'][b:b+1].cpu(),
+                        model_kwargs['freqs_cos'].cpu(),
+                        model_kwargs['freqs_sin'].cpu(),
+                        model_kwargs['indices'],
+                        n_tokens,
+                        cond_latents[b:b+1].cpu(),
+                    ))
+                    model_input_map[model_input_map_key] = len(model_input_cache) - 1
+                logger.info(f"Model input cache size: {len(model_input_cache)}")
+
+
 
             loss = training_step(
                 latents,
@@ -509,6 +702,10 @@ if __name__ == "__main__":
                     effective_update = (global_step + 1) // steps_per_update
 
                     if args.save_every > 0 and (effective_update % args.save_every == 0):
+                        if args.train_from_scratch:
+                            ckpt_path = Path(training_output_dir) / f"model_{args.model}_last.pt"
+                            logger.info(f"Saving full model checkpoint to {ckpt_path}")
+                            save_full_model_checkpoint(model_engine, args, epoch, step, training_output_dir)
                         if args.train_lora:
                             lora_ckpt_path = Path(training_output_dir) / f"lora_last.pt"
                             logger.info(f"Saving LoRA checkpoint to {lora_ckpt_path}")
@@ -517,6 +714,10 @@ if __name__ == "__main__":
                             patch_adapter_ckpt_path = Path(training_output_dir) / f"patch_adapter_last.pt"
                             logger.info(f"Saving PatchAdapter checkpoint to {patch_adapter_ckpt_path}")
                             save_patch_adapter_checkpoint(model_engine, args, epoch, step, training_output_dir)
+                        if args.train_multiple_kernels:
+                            multi_kernel_ckpt_path = Path(training_output_dir) / f"multi_kernel_last.pt"
+                            logger.info(f"Saving Multi-Kernel checkpoint to {multi_kernel_ckpt_path}")
+                            save_multi_kernel_checkpoint(model_engine, args, epoch, step, training_output_dir)
 
                 print(f"{latents.shape=}")
                 print(f"{cond_latents.shape=}")
