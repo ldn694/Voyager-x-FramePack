@@ -29,6 +29,7 @@ def parse_args(mode="eval", namespace=None):
     parser = add_inference_args(parser)
     parser = add_parallel_args(parser)
     parser = add_patch_adapter_args(parser)
+    parser = add_multiple_kernel_args(parser)
     
     if "eval_realestate10K" in mode:
         parser = add_realestate10K_eval_args(parser)
@@ -197,6 +198,8 @@ def add_training_args(parser: argparse.ArgumentParser):
                        help="Number of steps to accumulate gradients over before performing an update.")
     group.add_argument("--global-seed", type=int, default=42,
                        help="Global seed for reproducibility.")
+    group.add_argument("--train-from-scratch", action="store_true", 
+                       help="Train the model from scratch without loading any pre-trained weights.")
 
     # Checkpoint and model loading arguments
     group.add_argument("--resume", type=str, default=None,
@@ -532,7 +535,7 @@ def add_inference_args(parser: argparse.ArgumentParser):
     group.add_argument(
         "--model-base",
         type=str,
-        default="ckpts",
+        default=None,
         help="Root path of all the models, including t2v models and extra models.",
     )
     group.add_argument(
@@ -562,6 +565,11 @@ def add_inference_args(parser: argparse.ArgumentParser):
         "--use-cpu-offload",
         action="store_true",
         help="Use CPU offload for the model load.",
+    )
+    group.add_argument(
+        "--load-all",
+        action="store_true",
+        help="Load all the model states, including possible add-on modules.",
     )
 
     # ======================== General inference settings ========================
@@ -768,6 +776,30 @@ def add_patch_adapter_args(parser: argparse.ArgumentParser):
 
     group.add_argument(
         "--patch-adapter-path", type=str, default="", help="Weight path for patch adapter model."
+    )
+
+    return parser
+
+def add_multiple_kernel_args(parser: argparse.ArgumentParser):
+    """Add multiple kernel arguments
+    
+    These arguments configure the use of multiple kernels
+    """
+    group = parser.add_argument_group(title="Multiple Kernel args")
+
+    group.add_argument(
+        "--use-multiple-kernels", action="store_true", help="Whether to open multiple kernel mode."
+    )
+
+    group.add_argument(
+        "--multiple-kernels-path", type=str, default="", help="Weight path for multiple kernel model."
+    )
+
+    parser.add_argument(
+        "--use-kernel-indices",
+        action="append",      # collect multiple occurrences
+        nargs="+",            # accept multiple ints per occurrence
+        type=int
     )
 
     return parser

@@ -46,6 +46,65 @@ def _init_conv3d_from_pretrained(
         if old_conv.bias.data.shape == new_conv.bias.data.shape:
             new_conv.bias.data.copy_(old_conv.bias.data)
 
+def _init_conv3d_from_pretrained_top_left(
+    new_conv: nn.Conv3d,
+    old_conv: nn.Conv3d,
+) -> None:
+    """
+    Initialize new_conv weights (and bias) from old_conv by copying the old
+    kernel into the top-left corner of the new kernel and zeroing the rest.
+
+    - If kernel shapes are identical, do a direct copy.
+    - Otherwise, assumes:
+        * out_channels match
+        * in_channels match
+        * new kernel size is >= old kernel size in each dim
+      and copies:
+        new_w[:, :, :kt, :kh, :kw] = old_w
+      with everything else set to 0.
+    """
+    logger.info(
+        f"Initializing new Conv3d (top-left copy) of shape {new_conv.weight.shape} "
+        f"from old Conv3d of shape {old_conv.weight.shape}"
+    )
+
+    old_w = old_conv.weight.data
+    new_w = new_conv.weight.data
+
+    # Same full shape -> direct copy
+    if old_w.shape == new_w.shape:
+        new_w.copy_(old_w)
+    else:
+        # Check channel dims match
+        if old_w.shape[0] != new_w.shape[0] or old_w.shape[1] != new_w.shape[1]:
+            raise ValueError(
+                "Channel mismatch when initializing Conv3d:\n"
+                f"  old weight shape: {old_w.shape}\n"
+                f"  new weight shape: {new_w.shape}\n"
+                "Expected same out_channels and in_channels."
+            )
+
+        O, I, kt, kh, kw = old_w.shape
+        _, _, nkt, nkh, nkw = new_w.shape
+
+        # Ensure new kernel is not smaller than old kernel
+        if nkt < kt or nkh < kh or nkw < kw:
+            raise ValueError(
+                "New Conv3d kernel must be >= old kernel in each dimension for "
+                "top-left copy init.\n"
+                f"  old kernel: (kt={kt}, kh={kh}, kw={kw})\n"
+                f"  new kernel: (kt={nkt}, kh={nkh}, kw={nkw})"
+            )
+
+        # Zero everything, then copy old kernel into top-left corner
+        new_w.zero_()
+        new_w[:, :, 0:kt, 0:kh, 0:kw] = old_w
+
+    # Copy bias if present and same shape
+    if old_conv.bias is not None and new_conv.bias is not None:
+        if old_conv.bias.data.shape == new_conv.bias.data.shape:
+            new_conv.bias.data.copy_(old_conv.bias.data)
+
 def apply_patch_adapter_to_hunyuan_video(
     model: nn.Module,
     new_patch_size: Tuple[int, int, int],
@@ -99,7 +158,7 @@ def apply_patch_adapter_to_hunyuan_video(
     # If we have a previous PatchEmbed, initialize new Conv3d from it
     if isinstance(old_img_in, PatchEmbed):
         try:
-            _init_conv3d_from_pretrained(
+            _init_conv3d_from_pretrained_top_left(
                 new_img_in.proj,
                 old_img_in.proj,
             )
@@ -123,7 +182,7 @@ def apply_patch_adapter_to_hunyuan_video(
 
         if isinstance(old_condition_in, PatchEmbed):
             try:
-                _init_conv3d_from_pretrained(
+                _init_conv3d_from_pretrained_top_left(
                     new_condition_in.proj,
                     old_condition_in.proj,
                 )
@@ -147,9 +206,10 @@ def apply_patch_adapter_to_hunyuan_video(
         dtype=dtype,
     )
 
-    # Copy pretrained adaLN_modulation weights if possible
+    # # Copy pretrained adaLN_modulation weights if possible
     if isinstance(old_final_layer, FinalLayer):
         try:
+            logger.info("Copying adaLN_modulation weights from old FinalLayer to new FinalLayer...")
             new_final_layer.adaLN_modulation.load_state_dict(
                 old_final_layer.adaLN_modulation.state_dict()
             )
@@ -158,9 +218,9 @@ def apply_patch_adapter_to_hunyuan_video(
                 f"Warning: could not load adaLN_modulation weights from old FinalLayer: {e}"
             )
 
-    # Freeze AdaLN params so they are NOT updated during adapter training
-    for p in new_final_layer.adaLN_modulation.parameters():
-        p.requires_grad = False
+    # # Freeze AdaLN params so they are NOT updated during adapter training
+    # for p in new_final_layer.adaLN_modulation.parameters():
+    #     p.requires_grad = False
 
     model.final_layer = new_final_layer
     model.patch_size = list(new_patch_size)
@@ -173,13 +233,13 @@ def apply_patch_adapter_to_hunyuan_video(
             p.requires_grad = False
 
     # unfreeze img_in (adapter)
-    for p in model.img_in.parameters():
-        p.requires_grad = True
+    # for p in model.img_in.parameters():
+    #     p.requires_grad = True
 
     # unfreeze condition_in (adapter) if present
-    if getattr(model, "use_context_block", False):
-        for p in model.condition_in.parameters():
-            p.requires_grad = True
+    # if getattr(model, "use_context_block", False):
+    #     for p in model.condition_in.parameters():
+    #         p.requires_grad = True
 
     # unfreeze ONLY the patch-size dependent head inside FinalLayer (linear)
     for name, p in model.final_layer.named_parameters():
@@ -202,7 +262,7 @@ def get_patch_adapter_parameters(model: nn.Module) -> List[nn.Parameter]:
             params.append(p)
         elif name.startswith("condition_in.") and getattr(model, "use_context_block", False):
             params.append(p)
-        elif name.startswith("final_layer.linear"):
+        elif name.startswith("final_layer."):
             params.append(p)
 
     return params
@@ -218,11 +278,13 @@ def get_patch_adapter_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
     patch_sd: Dict[str, torch.Tensor] = {}
 
     for k, v in full_sd.items():
-        if k.startswith("img_in."):
-            patch_sd[k] = v
-        elif k.startswith("condition_in.") and getattr(model, "use_context_block", False):
-            patch_sd[k] = v
-        elif k.startswith("final_layer.linear"):
+        # if k.startswith("img_in."):
+        #     patch_sd[k] = v
+        # elif k.startswith("condition_in.") and getattr(model, "use_context_block", False):
+        #     patch_sd[k] = v
+        # elif k.startswith("final_layer."):
+        #     patch_sd[k] = v
+        if k.startswith("final_layer.linear."):
             patch_sd[k] = v
 
     return patch_sd

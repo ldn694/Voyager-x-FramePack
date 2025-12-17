@@ -10,6 +10,7 @@ import PIL.Image
 from typing import Union, Optional, List
 
 from voyager.modules.posemb_layers import get_nd_rotary_pos_embed
+from voyager.modules.compression_scheduler import CompressionScheduler
 from voyager.vae import AutoencoderKLCausal3D
 
 from pathlib import Path
@@ -332,15 +333,34 @@ def prepare_model_inputs(
     target_ndim = 3  # n-d RoPE
     ndim = len(latents.shape) - 2
     latents_size = list(latents.shape[-ndim:])
-    freqs_cos, freqs_sin = get_rope_freq_from_size(
-        args,
-        model,
-        latents_size,
-        ndim,
-        target_ndim,
-        rope_theta_rescale_factor=rope_theta_rescale_factor,
-        rope_interpolation_factor=rope_interpolation_factor,
-    )
+    if args.train_multiple_kernels:
+        scheduler = CompressionScheduler(
+            schedule_config={
+                "patch_sizes": args.kernel_sizes if args.kernel_sizes is not None else model.patch_size,
+            }
+        )
+        indices = args.kernel_indices if args.kernel_indices is not None else [range(latents_size[0])]
+        freqs_cos, freqs_sin = scheduler.get_rope_freq(
+            indices,
+            args.rope_theta,
+            model.hidden_size // model.heads_num,
+            model.rope_dim_list,
+            latents_size,
+            ndim,
+            target_ndim,
+            rope_theta_rescale_factor=rope_theta_rescale_factor,
+            rope_interpolation_factor=rope_interpolation_factor,
+        )
+    else:
+        freqs_cos, freqs_sin = get_rope_freq_from_size(
+            args,
+            model,
+            latents_size,
+            ndim,
+            target_ndim,
+            rope_theta_rescale_factor=rope_theta_rescale_factor,
+            rope_interpolation_factor=rope_interpolation_factor,
+        )
 
     # ===================================== Pack model kwargs ==================================
     model_kwargs = dict(
@@ -350,6 +370,7 @@ def prepare_model_inputs(
         freqs_cos=freqs_cos,  # [seqlen, head_dim]
         freqs_sin=freqs_sin,  # [seqlen, head_dim]
         return_dict=True,
+        indices = args.kernel_indices if args.train_multiple_kernels else None,
     )
 
     latents = latents.to(dtype=model.dtype)

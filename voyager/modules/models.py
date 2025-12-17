@@ -12,12 +12,13 @@ import torch.utils.checkpoint
 
 from .activation_layers import get_activation_layer
 from .norm_layers import get_norm_layer
-from .embed_layers import TimestepEmbedder, PatchEmbed, TextProjection
+from .embed_layers import TimestepEmbedder, PatchEmbed, TextProjection, MultiPatchEmbed
 from .attenion import attention, parallel_attention, get_cu_seqlens
 from .posemb_layers import apply_rotary_emb
-from .mlp_layers import MLP, MLPEmbedder, FinalLayer
+from .mlp_layers import MLP, MLPEmbedder, FinalLayer, MultiFinalLayer
 from .modulate_layers import ModulateDiT, modulate, apply_gate, ckpt_wrapper
 from .token_refiner import SingleTokenRefiner
+from ..utils.helpers import to_3tuple
 
 
 class MMDoubleStreamBlock(nn.Module):
@@ -548,11 +549,13 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         use_attention_mask: bool = True,
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
+        patch_sizes: Optional[List[List[int]]] = None,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
 
         self.patch_size = patch_size
+        self.patch_sizes = patch_sizes
         self.in_channels = in_channels
         self.out_channels = in_channels if out_channels is None else out_channels
         self.unpatchify_channels = self.out_channels
@@ -593,6 +596,12 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         self.img_in = PatchEmbed(
             self.patch_size, self.in_channels, self.hidden_size, **factory_kwargs
         )
+
+        # multi image projection
+        if patch_sizes is not None:
+            self.img_in = MultiPatchEmbed(
+                patch_sizes, self.in_channels, self.hidden_size, **factory_kwargs
+            )
 
         # text projection
         if self.text_projection == "linear":
@@ -671,6 +680,15 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             **factory_kwargs,
         )
 
+        if patch_sizes is not None:
+            self.final_layer = MultiFinalLayer(
+                patch_sizes,
+                self.hidden_size,
+                self.out_channels,
+                get_activation_layer("silu"),
+                **factory_kwargs,
+            )
+
         # context block
         self.use_context_block = args.use_context_block
         if self.use_context_block:
@@ -729,7 +747,20 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         # Guidance for modulation, should be cfg_scale x 1000.
         guidance: torch.Tensor = None,
         return_dict: bool = True,
+        indices: Optional[List[int]] = None,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+        print(f"{x.shape=} {x.min()=} {x.max()=} {x.mean()=}")
+        print(f"latent {x[:, :16, :, :, :].shape=} {x[:, :16, :, :, :].min()=} {x[:, :16, :, :, :].max()=} {x[:, :16, :, :, :].mean()=}")
+        print(f"img_latent {x[:, 16:32, :, :, :].shape=} {x[:, 16:32, :, :, :].min()=} {x[:, 16:32, :, :, :].max()=} {x[:, 16:32, :, :, :].mean()=}")
+        print(f"mask_concat {x[:, 32:33, :, :, :].shape=} {x[:, 32:33, :, :, :].min()=} {x[:, 32:33, :, :, :].max()=} {x[:, 32:33, :, :, :].mean()=}")
+        print(f"partial_cond {x[:, 33:49, :, :, :].shape=} {x[:, 33:49, :, :, :].min()=} {x[:, 33:49, :, :, :].max()=} {x[:, 33:49, :, :, :].mean()=}")
+        print(f"partial_mask {x[:, 49:, :, :, :].shape=} {x[:, 49:, :, :, :].min()=} {x[:, 49:, :, :, :].max()=} {x[:, 49:, :, :, :].mean()=}")
+        print(f"{t.shape=} {t=}")
+        print(f"{text_states.shape=} {text_states.min()=} {text_states.max()} {text_states.mean()=}")
+        print(f"{text_states_2.shape=} {text_states_2.min()=} {text_states_2.max()=} {text_states_2.mean()=}")
+        print(f"{freqs_cos.shape=} {freqs_cos.min()=} {freqs_cos.max()=} {freqs_cos.mean()=}")
+        print(f"{freqs_sin.shape=} {freqs_sin.min()=} {freqs_sin.max()=} {freqs_sin.mean()=}")
+
         out = {}
         img = x
         txt = text_states
@@ -774,7 +805,11 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             condition = condition[..., -height:, :]  # depth
             condition = self.condition_in(condition)
 
-        img = self.img_in(img)
+        if self.patch_sizes is not None:
+            img, patch_indices = self.img_in(img, indices=indices)
+        else:
+            img = self.img_in(img)
+        
         if self.text_projection == "linear":
             txt = self.txt_in(txt)
         elif self.text_projection == "single_refiner":
@@ -907,9 +942,19 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
 
         # ---------------------------- Final layer ------------------------------
         # (N, T, patch_size ** 2 * out_channels)
-        img = self.final_layer(img, vec)
-
-        img = self.unpatchify(img, tt, th, tw)
+        if self.patch_sizes is None:
+            img = self.final_layer(img, vec)
+            img = self.unpatchify(img, tt, th, tw)
+        else:
+            img = self.final_layer(img, vec, indices=indices, patch_indices=patch_indices)
+            img = self.unpatchify_multi(
+                img,
+                T=ot,
+                H=oh,
+                W=ow,
+                patch_sizes=self.patch_sizes,
+                indices=indices,
+            )
         if return_dict:
             out["x"] = img
             return out
@@ -929,6 +974,111 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         imgs = x.reshape(shape=(x.shape[0], c, t * pt, h * ph, w * pw))
 
         return imgs
+    
+    def unpatchify_multi(
+        self,
+        xs,
+        T: int,
+        H: int,
+        W: int,
+        patch_sizes,
+        indices,
+    ) -> torch.Tensor:
+        """
+        Inverse of MultiPatchEmbed + MultiFinalLayer.
+
+        Args:
+            xs (List[Tensor]):
+                List of tensors from MultiFinalLayer. For kernel k,
+                xs[k] has shape (B, N_k, C * pt * ph * pw), where
+                patch_sizes[k] == (pt, ph, pw) (after to_3tuple).
+            T, H, W (int):
+                Original temporal and spatial resolution of the latent.
+                The returned tensor will have shape (B, C, T, H, W).
+            patch_sizes (Sequence[int or Sequence[int]]):
+                Per-kernel patch sizes. Each element is either an int
+                or a (pt, ph, pw)-like sequence.
+            indices (Sequence[Tensor]):
+                Per-kernel 1D LongTensor listing the frame indices
+                where the corresponding kernel was applied (same
+                semantics as in MultiPatchEmbed).
+
+        Returns:
+            torch.Tensor:
+                Reconstructed latent of shape (B, C, T, H, W).
+        """
+        # Basic checks
+        if not xs:
+            raise ValueError("unpatchify_multi: 'xs' is empty.")
+        x0 = xs[0]
+        B = x0.shape[0]
+        C = self.unpatchify_channels
+        device = x0.device
+        dtype = x0.dtype
+
+        # Output volume and weight map for averaging overlaps
+        out = torch.zeros(B, C, T, H, W, device=device, dtype=dtype)
+        weight = torch.zeros(1, 1, T, H, W, device=device, dtype=dtype)
+
+        for x_k, patch_size, idxs in zip(xs, patch_sizes, indices):
+            # Normalize patch size to (pt, ph, pw)
+            pt, ph, pw = to_3tuple(patch_size)
+
+            # Number of frames this kernel was applied to
+            T_k = len(idxs)
+            if T_k == 0:
+                continue
+
+            # Spatial patch grid for this kernel
+            if H % ph != 0 or W % pw != 0:
+                raise ValueError(
+                    f"unpatchify_multi: H={H}, W={W} not divisible by patch "
+                    f"size (ph={ph}, pw={pw})."
+                )
+            H_k = H // ph
+            W_k = W // pw
+
+            expected_tokens = T_k * H_k * W_k
+            if x_k.shape[1] != expected_tokens:
+                raise ValueError(
+                    "unpatchify_multi: token count mismatch for patch size "
+                    f"{patch_size}. Got {x_k.shape[1]} tokens, expected "
+                    f"{expected_tokens} (= T_k*H_k*W_k)."
+                )
+
+            # x_k: (B, N_k, C * pt * ph * pw)
+            x_k = x_k.view(B, T_k, H_k, W_k, C, pt, ph, pw)
+            # -> (B, C, T_k * pt, H_k * ph, W_k * pw)
+            x_k = torch.einsum("nthwcopq->nctohpwq", x_k)
+            x_k = x_k.reshape(B, C, T_k * pt, H_k * ph, W_k * pw)
+
+            # Scatter into global volume along temporal dimension
+            # Each local time slice corresponds to global frame idxs[local_t]
+            for local_t, global_t in enumerate(idxs):
+                t_local_slice = slice(local_t * pt, (local_t + 1) * pt)
+                t_global_slice = slice(global_t * pt, (global_t + 1) * pt)
+
+                if t_global_slice.stop > T * pt:
+                    raise ValueError(
+                        "unpatchify_multi: temporal slice exceeds target size: "
+                        f"global_t={global_t}, pt={pt}, T={T}"
+                    )
+
+                out[:, :, t_global_slice, :, :] += x_k[:, :, t_local_slice, :, :]
+                weight[:, :, t_global_slice, :, :] += 1
+
+        # Make sure all pixels were written at least once
+        if (weight == 0).any():
+            raise ValueError(
+                "unpatchify_multi: some positions in the output volume were "
+                "never written to. Check 'patch_sizes' and 'indices'."
+            )
+
+        # Average overlapping contributions
+        out = out / weight
+
+        return out
+
 
     def params_count(self):
         counts = {
@@ -988,5 +1138,14 @@ HUNYUAN_VIDEO_CONFIG = {
         "hidden_size": 480,
         "heads_num": 5,
         "mlp_width_ratio": 4,
+    },
+    "HYVideo-S/2-4x4": {
+        "mm_double_blocks_depth": 6,
+        "mm_single_blocks_depth": 12,
+        "rope_dim_list": [12, 42, 42],
+        "hidden_size": 480,
+        "heads_num": 5,
+        "mlp_width_ratio": 4,
+        "patch_size": [1, 4, 4],
     },
 }

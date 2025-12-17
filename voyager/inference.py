@@ -20,6 +20,7 @@ from voyager.utils.data_utils import align_to, get_closest_ratio, generate_crop_
 from voyager.utils.lora_utils import load_lora_for_pipeline
 from voyager.utils.geometry import get_plucker_coordinates
 from voyager.utils.train_utils import load_state_dict
+from voyager.modules.compression_scheduler import CompressionScheduler
 from voyager.modules.posemb_layers import get_nd_rotary_pos_embed
 from voyager.modules.fp8_optimization import convert_fp8_linear
 from voyager.diffusion.schedulers import FlowMatchDiscreteScheduler
@@ -31,6 +32,10 @@ from safetensors.torch import load_file
 import cv2
 import pyexr
 import torchvision.transforms as T
+
+from voyager.modules.lora_layers import apply_lora_to_hunyuan_video, load_lora_state_dict
+from voyager.modules.custom_patch_embed import apply_patch_adapter_to_hunyuan_video, load_patch_adapter_state_dict
+from voyager.modules.multi_kernel import apply_multikernel_to_hunyuan_video, load_multikernel_state_dict
 
 try:
     import xfuser
@@ -287,9 +292,60 @@ def load_models(args, device, logger, pretrained_model_path):
         factor_kwargs=factor_kwargs,
     )
     
-    model = model.to(device)
-    model = load_state_dict(args, model, logger, pretrained_model_path)
-    model.eval()
+    # model = model.to(device)
+    if pretrained_model_path is not None:
+        if args.load_all:
+            logger.info(f"Loading all model states from {pretrained_model_path}...")
+            checkpoint = torch.load(pretrained_model_path, map_location="cpu", weights_only=False)
+            load_output = model.load_state_dict(checkpoint["model"], strict=False)
+            print("Missing keys:", load_output.missing_keys)
+            print("Unexpected keys:", load_output.unexpected_keys)
+        else:
+            model = load_state_dict(args, model, logger, pretrained_model_path)
+
+    if args.use_lora and args.lora_path is not None:
+        logger.info(f"Loading LoRA from {args.lora_path}...")
+        lora_ckpt = torch.load(args.lora_path, map_location="cpu", weights_only=False)
+        lora_args = lora_ckpt["args"]
+        print(lora_args)
+        apply_lora_to_hunyuan_video(
+            model,
+            r=lora_args["lora_rank"] if "lora_rank" in lora_args else 4,
+            lora_alpha=lora_args["lora_alpha"] if "lora_alpha" in lora_args else 16.0,
+            lora_dropout=lora_args["lora_dropout"] if "lora_dropout" in lora_args else 0.0,
+            freeze_base=True,
+        )
+        load_lora_state_dict(model, lora_ckpt["lora"], strict=False)
+    if args.use_patch_adapter and args.patch_adapter_path is not None:
+        logger.info(f"Loading Patch Adapter from {args.patch_adapter_path}...")
+        patch_adapter_ckpt = torch.load(args.patch_adapter_path, map_location="cpu", weights_only=False)
+        patch_adapter_args = patch_adapter_ckpt["args"]
+        print(patch_adapter_args)
+        apply_patch_adapter_to_hunyuan_video(
+            model,
+            new_patch_size=tuple(patch_adapter_args["patch_adapter_size"]) if "patch_adapter_size" in patch_adapter_args else (1,2,2),
+            freeze_base=True,
+        )
+        load_patch_adapter_state_dict(model, patch_adapter_ckpt["patch_adapter"], strict=False)
+    if args.use_multiple_kernels and args.multiple_kernels_path is not None:
+        logger.info(f"Loading Multiple Kernels from {args.multiple_kernels_path}...")
+        multiple_kernels_ckpt = torch.load(args.multiple_kernels_path, map_location="cpu", weights_only=False)
+        multiple_kernels_args = multiple_kernels_ckpt["args"]
+        print(multiple_kernels_args)
+        apply_multikernel_to_hunyuan_video(
+            model,
+            patch_sizes=multiple_kernels_args["kernel_sizes"] if "kernel_sizes" in multiple_kernels_args else [[1, 2, 2]],
+        )
+        load_multikernel_state_dict(model, multiple_kernels_ckpt["multi_kernel"], strict=False)
+
+    if hasattr(args, "train_from_scratch") and args.train_from_scratch:
+        logger.info("Training from scratch, not loading any pre-trained weights.")
+        model.train()
+    else:
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad = False
+    logger.info(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 
     # VAE
     vae, _, s_ratio, t_ratio = load_vae(
@@ -321,34 +377,39 @@ def load_models(args, device, logger, pretrained_model_path):
     prompt_template_video = PROMPT_TEMPLATE[
         args.prompt_template_video] if args.prompt_template_video is not None else None
 
-    # Text encoder
-    text_encoder = TextEncoder(
-        text_encoder_type=args.text_encoder,
-        max_length=max_length,
-        text_encoder_precision=args.text_encoder_precision,
-        tokenizer_type=args.tokenizer,
-        i2v_mode=args.i2v_mode,
-        prompt_template=prompt_template,
-        prompt_template_video=prompt_template_video,
-        hidden_state_skip_layer=args.hidden_state_skip_layer,
-        apply_final_norm=args.apply_final_norm,
-        reproduce=args.reproduce,
-        logger=logger,
-        device=device if not args.use_cpu_offload else "cpu",
-        image_embed_interleave=image_embed_interleave
-    ).to(device)
-
-    text_encoder_2 = None
-    if args.text_encoder_2 is not None:
-        text_encoder_2 = TextEncoder(
-            text_encoder_type=args.text_encoder_2,
-            max_length=args.text_len_2,
-            text_encoder_precision=args.text_encoder_precision_2,
-            tokenizer_type=args.tokenizer_2,
+    if hasattr(args, "use_cache_text_encoder") and args.use_cache_text_encoder:
+        logger.info("Text encoder caching is enabled.")
+        text_encoder = None
+        text_encoder_2 = None
+    else:
+        # Text encoder
+        text_encoder = TextEncoder(
+            text_encoder_type=args.text_encoder,
+            max_length=max_length,
+            text_encoder_precision=args.text_encoder_precision,
+            tokenizer_type=args.tokenizer,
+            i2v_mode=args.i2v_mode,
+            prompt_template=prompt_template,
+            prompt_template_video=prompt_template_video,
+            hidden_state_skip_layer=args.hidden_state_skip_layer,
+            apply_final_norm=args.apply_final_norm,
             reproduce=args.reproduce,
             logger=logger,
             device=device if not args.use_cpu_offload else "cpu",
+            image_embed_interleave=image_embed_interleave
         ).to(device)
+
+        text_encoder_2 = None
+        if args.text_encoder_2 is not None:
+            text_encoder_2 = TextEncoder(
+                text_encoder_type=args.text_encoder_2,
+                max_length=args.text_len_2,
+                text_encoder_precision=args.text_encoder_precision_2,
+                tokenizer_type=args.tokenizer_2,
+                reproduce=args.reproduce,
+                logger=logger,
+                device=device if not args.use_cpu_offload else "cpu",
+            ).to(device)
 
     return model, vae, text_encoder, text_encoder_2, vae_kwargs
 
@@ -551,13 +612,13 @@ class HunyuanVideoSampler(Inference):
 
         if args.i2v_mode:
             self.default_negative_prompt = NEGATIVE_PROMPT_I2V
-            if args.use_lora:
-                self.pipeline = load_lora_for_pipeline(
-                    self.pipeline, args.lora_path, LORA_PREFIX_TRANSFORMER="Hunyuan_video_I2V_lora",
-                    alpha=args.lora_scale, device=self.device,
-                    is_parallel=(self.parallel_args['ulysses_degree'] > 1 or self.parallel_args['ring_degree'] > 1))
-                logger.info(
-                f"load lora {args.lora_path} into pipeline, lora scale is {args.lora_scale}.")
+            # if args.use_lora:
+            #     self.pipeline = load_lora_for_pipeline(
+            #         self.pipeline, args.lora_path, LORA_PREFIX_TRANSFORMER="Hunyuan_video_I2V_lora",
+            #         alpha=args.lora_scale, device=self.device,
+            #         is_parallel=(self.parallel_args['ulysses_degree'] > 1 or self.parallel_args['ring_degree'] > 1))
+            #     logger.info(
+            #     f"load lora {args.lora_path} into pipeline, lora scale is {args.lora_scale}.")
         else:
             self.default_negative_prompt = NEGATIVE_PROMPT
 
@@ -716,7 +777,7 @@ class HunyuanVideoSampler(Inference):
         if isinstance(path, tuple):
             ref_rgb = self.load_image(path[0], image_size)
             ref_depth = self.load_image(path[1], image_size)
-            return torch.cat([ref_rgb, torch.ones_like(ref_rgb)[..., :16, :], ref_depth], dim=1)
+            return torch.cat([ref_rgb, torch.ones_like(ref_rgb)[..., :64, :], ref_depth], dim=1)
 
         if path.endswith('.exr'):
             depth = torch.from_numpy(cv2.resize(pyexr.read(path).squeeze(
@@ -757,6 +818,7 @@ class HunyuanVideoSampler(Inference):
         ref_images=None,
         partial_cond=None,
         partial_mask=None,
+        use_kernel_indices=None,
         **kwargs,
     ):
         out_dict = dict()
@@ -811,7 +873,7 @@ class HunyuanVideoSampler(Inference):
         )
 
         target_height = height  # align_to(height, 16)
-        target_height = target_height * 2 + 16
+        target_height = target_height * 2 + 64
         target_width = width  # align_to(width, 16)
         target_video_length = video_length
 
@@ -868,6 +930,10 @@ class HunyuanVideoSampler(Inference):
             image_path, image_size=closest_size) for image_path in partial_mask]
         partial_mask = torch.stack(
             partial_mask, dim=1).unsqueeze(0).to(self.device)
+        
+        logger.info("Before encoding condition:")
+        logger.info(f"{partial_mask.shape=} {partial_mask.min()=} {partial_mask.max()=}")
+        logger.info(f"{partial_cond.shape=} {partial_cond.min()=} {partial_cond.max()=}")
 
         # Use automatic mixed precision for memory efficiency during encoding
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
@@ -933,22 +999,60 @@ class HunyuanVideoSampler(Inference):
             # plucker_features = torch.cat([plucker_features,
             #     torch.ones(1, 6, plucker_features.shape[2], 2, plucker_features.shape[-1]).to(self.device),
             #     plucker_features], dim=-2)
+        
+        logger.info("After encoding condition:")
+        logger.info(f"{partial_mask.shape=} {partial_mask.min()=} {partial_mask.max()=}")
+        logger.info(f"{partial_cond.shape=} {partial_cond.min()=} {partial_cond.max()=}")
+        logger.info(f"{ref_latents.shape=} {ref_latents.min()=} {ref_latents.max()=}")
+        logger.info(f"{len(ref_images)} {type(ref_images[0])} {ref_images[0].size}")
 
         # Generate rotary position embeddings for the target video dimensions
         # These embeddings provide positional information to the transformer model
-        freqs_cos, freqs_sin = self.get_rotary_pos_embed(
+        if self.args.use_multiple_kernels:
+            logger.info("Using multiple kernels, calculating rotary embeddings.")
+            # Compute latent size
+            if "884" in self.args.vae:
+                latents_size = [(target_video_length - 1) // 4 +
+                                1, target_height // 8, target_width // 8]
+            elif "888" in self.args.vae:
+                latents_size = [(target_video_length - 1) // 8 +
+                                1, target_height // 8, target_width // 8]
+            else:
+                latents_size = [target_video_length,
+                                target_height // 8, target_width // 8]
+            target_ndim = 3
+            ndim = 5 - 2  # B, C, F, H, W -> F, H, W
+            scheduler = CompressionScheduler(
+                schedule_config={
+                    "patch_sizes": self.args.use_kernel_sizes if self.args.use_kernel_sizes is not None else self.model.patch_size,
+                }
+            )
+            indices = self.args.use_kernel_indices if self.args.use_kernel_indices is not None else [range(latents_size[0])]
+            freqs_cos, freqs_sin = scheduler.get_rope_freq(
+                indices,
+                self.args.rope_theta,
+                self.model.hidden_size // self.model.heads_num,
+                self.model.rope_dim_list,
+                latents_size,
+                ndim,
+                target_ndim,
+                rope_theta_rescale_factor=1.0,
+                rope_interpolation_factor=1.0,
+            )
+        else:
+            freqs_cos, freqs_sin = self.get_rotary_pos_embed(
             target_video_length, target_height, target_width
-        )
+        )   
         
         # Generate rotary position embeddings for conditional frames
         # Adjusted dimensions account for the conditional frame structure
         freqs_cos_cond, freqs_sin_cond = self.get_rotary_pos_embed(
-            target_video_length, (target_height - 16) // 2, target_width
+            target_video_length, (target_height - 64) // 2, target_width
         )
         
         # Calculate the total number of tokens for the transformer model
         # This determines the sequence length for attention mechanisms
-        n_tokens = freqs_cos.shape[0]
+        n_tokens = freqs_cos.shape[0] if freqs_cos is not None else 0
 
         debug_str = f"""
                         height: {target_height}
@@ -961,6 +1065,7 @@ class HunyuanVideoSampler(Inference):
          num_videos_per_prompt: {num_videos_per_prompt}
                 guidance_scale: {guidance_scale}
                       n_tokens: {n_tokens}
+            use_kernel_indices: {use_kernel_indices}
                     flow_shift: {flow_shift}
        embedded_guidance_scale: {embedded_guidance_scale}
                  i2v_stability: {i2v_stability}"""
@@ -986,7 +1091,8 @@ class HunyuanVideoSampler(Inference):
             freqs_cis_cond=(freqs_cos_cond, freqs_sin_cond),
             n_tokens=n_tokens,
             embedded_guidance_scale=embedded_guidance_scale,
-            data_type="video" if target_video_length > 1 else "image",
+            # data_type="video" if target_video_length > 1 else "image",
+            data_type="video",
             is_progress_bar=True,
             vae_ver=self.args.vae,
             enable_tiling=self.args.vae_tiling,
@@ -996,7 +1102,9 @@ class HunyuanVideoSampler(Inference):
             img_latents=ref_latents,
             semantic_images=ref_images,
             partial_cond=partial_cond,
-            partial_mask=partial_mask
+            partial_mask=partial_mask,
+            use_kernel_indices=use_kernel_indices,
+            logger=logger,
         )[0]
         out_dict["samples"] = samples
         out_dict["prompts"] = prompt

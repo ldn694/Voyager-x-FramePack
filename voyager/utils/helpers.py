@@ -119,3 +119,7 @@ def as_list_of_2tuple(x):
     for i in range(0, len(x), 2):
         lst.append((x[i], x[i + 1]))
     return lst
+
+def as_list_of_3tuple(x):
+    # x is a list of list, convert to list of 3-tuples
+    return [to_3tuple(item) for item in x]
