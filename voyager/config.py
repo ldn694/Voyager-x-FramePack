@@ -30,6 +30,7 @@ def parse_args(mode="eval", namespace=None):
     parser = add_parallel_args(parser)
     parser = add_patch_adapter_args(parser)
     parser = add_multiple_kernel_args(parser)
+    parser = add_double_branch_args(parser)
     
     if "eval_realestate10K" in mode:
         parser = add_realestate10K_eval_args(parser)
@@ -238,6 +239,10 @@ def add_training_args(parser: argparse.ArgumentParser):
                        help="Enable TensorBoard logging.")
     group.add_argument("--profile", action="store_true",
                        help="Enable PyTorch profiler.")
+    
+    # Early stopping
+    group.add_argument("--early-stop-training-loss", type=float, default=None,
+                       help="Early stop training if the loss is below this value.")
     return parser
 
 
@@ -830,6 +835,31 @@ def add_parallel_args(parser: argparse.ArgumentParser):
         type=int,
         default=1,
         help="Ring degree for xdit parallel args.",
+    )
+
+    return parser
+
+def add_double_branch_args(parser: argparse.ArgumentParser):
+    """Add double-branch model arguments
+    
+    These arguments configure the double-branch architecture for
+    specialized training or inference scenarios.
+    """
+    group = parser.add_argument_group(title="Double-branch model args")
+
+    group.add_argument(
+        "--use-double-branch", action="store_true", help="Whether to open double-branch model mode."
+    )
+
+    group.add_argument(
+        "--double-branch-path", type=str, default=None, help="Weight path for double-branch model."
+    )
+
+    group.add_argument(
+        "--model-with-double-branch",
+        type=str,
+        choices=list(HUNYUAN_VIDEO_CONFIG.keys()),
+        default="HYVideo-T/2-2branch-cross_attn",
     )
 
     return parser

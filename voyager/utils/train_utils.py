@@ -223,6 +223,40 @@ def set_reproducibility(enable, global_seed=None):
 
     # LSTM and RNN networks are not deterministic
 
+def build_rope(latents, args, model, rope_theta_rescale_factor=1.0, rope_interpolation_factor=1.0):
+    # ======================================== Build RoPE ======================================
+    target_ndim = 3  # n-d RoPE
+    ndim = len(latents.shape) - 2
+    latents_size = list(latents.shape[-ndim:])
+    if args.train_multiple_kernels:
+        scheduler = CompressionScheduler(
+            schedule_config={
+                "patch_sizes": args.kernel_sizes if args.kernel_sizes is not None else model.patch_size,
+            }
+        )
+        indices = args.kernel_indices if args.kernel_indices is not None else [range(latents_size[0])]
+        freqs_cos, freqs_sin = scheduler.get_rope_freq(
+            indices,
+            args.rope_theta,
+            model.hidden_size // model.heads_num,
+            model.rope_dim_list,
+            latents_size,
+            ndim,
+            target_ndim,
+            rope_theta_rescale_factor=rope_theta_rescale_factor,
+            rope_interpolation_factor=rope_interpolation_factor,
+        )
+    else:
+        freqs_cos, freqs_sin = get_rope_freq_from_size(
+            args,
+            model,
+            latents_size,
+            ndim,
+            target_ndim,
+            rope_theta_rescale_factor=rope_theta_rescale_factor,
+            rope_interpolation_factor=rope_interpolation_factor,
+        )
+    return freqs_cos, freqs_sin
 
 def prepare_model_inputs(
     args,
@@ -234,6 +268,7 @@ def prepare_model_inputs(
     text_encoder_2=None,
     rope_theta_rescale_factor: Union[float, List[float]] = 1.0,
     rope_interpolation_factor: Union[float, List[float]] = 1.0,
+    skip_cond_latent: bool = False,
 ):
     media, latents, *batch_args = batch
     if args.use_cache_text_encoder:
@@ -291,76 +326,54 @@ def prepare_model_inputs(
                 else:
                     latents.mul_(vae.config.scaling_factor)
     elif len(latents.shape) == 5 or len(latents.shape) == 4:  # Using video/image cache
-        latents = (
-            latents * vae.config.scaling_factor
-        )  # vae cache is not multiplied by scaling_factor
+        pass
+        # latents = (
+        #     latents * vae.config.scaling_factor
+        # )  # vae cache is not multiplied by scaling_factor
     else:
         raise ValueError(
             f"Only support media/latent with shape (b, c, h, w) or (b, c, f, h, w), \
                 but got {media.shape} {latents.shape}."
         )
+    
+    if not skip_cond_latent:
+        cond_latents = get_cond_latents(args, latents, vae)
+        is_uncond = (
+            torch.tensor(1).to(torch.int64)
+            if random.random() < args.sematic_cond_drop_p
+            else torch.tensor(0).to(torch.int64)
+        )
+        semantic_images = get_cond_images(args, latents, vae, is_uncond=is_uncond)
 
-    cond_latents = get_cond_latents(args, latents, vae)
-    is_uncond = (
-        torch.tensor(1).to(torch.int64)
-        if random.random() < args.sematic_cond_drop_p
-        else torch.tensor(0).to(torch.int64)
-    )
-    semantic_images = get_cond_images(args, latents, vae, is_uncond=is_uncond)
-
-    # ======================================== Encode text ======================================
-    # Autocast is handled by text_encoder itself.
-    # Whether to apply text_mask is determined by args.use_attention_mask.
-    if text_states is None or text_mask is None:
-        with torch.no_grad():
-            text_outputs = text_encoder.encode(
-                {"input_ids": text_ids, "attention_mask": text_mask},
-                data_type=batch_args[-1]["type"][0],
-                semantic_images=semantic_images,
-            )
-            text_states = text_outputs.hidden_state
-            text_mask = text_outputs.attention_mask
-            text_states_2 = (
-                text_encoder_2.encode(
-                    {"input_ids": text_ids_2, "attention_mask": text_mask_2},
-                    data_type=data_type,
-                ).hidden_state
-                if text_encoder_2 is not None
-                else None
-            )
+        # ======================================== Encode text ======================================
+        # Autocast is handled by text_encoder itself.
+        # Whether to apply text_mask is determined by args.use_attention_mask.
+        if text_states is None or text_mask is None:
+            with torch.no_grad():
+                text_outputs = text_encoder.encode(
+                    {"input_ids": text_ids, "attention_mask": text_mask},
+                    data_type=batch_args[-1]["type"][0],
+                    semantic_images=semantic_images,
+                )
+                text_states = text_outputs.hidden_state
+                text_mask = text_outputs.attention_mask
+                text_states_2 = (
+                    text_encoder_2.encode(
+                        {"input_ids": text_ids_2, "attention_mask": text_mask_2},
+                        data_type=data_type,
+                    ).hidden_state
+                    if text_encoder_2 is not None
+                    else None
+                )
 
     # ======================================== Build RoPE ======================================
-    target_ndim = 3  # n-d RoPE
-    ndim = len(latents.shape) - 2
-    latents_size = list(latents.shape[-ndim:])
-    if args.train_multiple_kernels:
-        scheduler = CompressionScheduler(
-            schedule_config={
-                "patch_sizes": args.kernel_sizes if args.kernel_sizes is not None else model.patch_size,
-            }
-        )
-        indices = args.kernel_indices if args.kernel_indices is not None else [range(latents_size[0])]
-        freqs_cos, freqs_sin = scheduler.get_rope_freq(
-            indices,
-            args.rope_theta,
-            model.hidden_size // model.heads_num,
-            model.rope_dim_list,
-            latents_size,
-            ndim,
-            target_ndim,
-            rope_theta_rescale_factor=rope_theta_rescale_factor,
-            rope_interpolation_factor=rope_interpolation_factor,
-        )
-    else:
-        freqs_cos, freqs_sin = get_rope_freq_from_size(
-            args,
-            model,
-            latents_size,
-            ndim,
-            target_ndim,
-            rope_theta_rescale_factor=rope_theta_rescale_factor,
-            rope_interpolation_factor=rope_interpolation_factor,
-        )
+    freqs_cos, freqs_sin = build_rope(
+        latents,
+        args,
+        model,
+        rope_theta_rescale_factor=rope_theta_rescale_factor,
+        rope_interpolation_factor=rope_interpolation_factor,
+    )
 
     # ===================================== Pack model kwargs ==================================
     model_kwargs = dict(
@@ -374,9 +387,11 @@ def prepare_model_inputs(
     )
 
     latents = latents.to(dtype=model.dtype)
-    cond_latents = cond_latents.to(dtype=model.dtype)
-
-    return latents, model_kwargs, freqs_cos.shape[0], cond_latents
+    if not skip_cond_latent:
+        cond_latents = cond_latents.to(dtype=model.dtype)
+        return latents, model_kwargs, freqs_cos.shape[0], cond_latents
+    else:
+        return latents, model_kwargs, freqs_cos.shape[0]
 
 
 def format_params(params):

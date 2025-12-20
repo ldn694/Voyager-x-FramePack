@@ -19,6 +19,7 @@ from .mlp_layers import MLP, MLPEmbedder, FinalLayer, MultiFinalLayer
 from .modulate_layers import ModulateDiT, modulate, apply_gate, ckpt_wrapper
 from .token_refiner import SingleTokenRefiner
 from ..utils.helpers import to_3tuple
+from .transformer_branch_config import TransformerBranchConfig
 
 
 class MMDoubleStreamBlock(nn.Module):
@@ -423,16 +424,26 @@ class MMSingleStreamBlock(nn.Module):
 
         # Apply RoPE if needed.
         if freqs_cis is not None:
-            img_q, txt_q = q[:, :-txt_len, :, :], q[:, -txt_len:, :, :]
-            img_k, txt_k = k[:, :-txt_len, :, :], k[:, -txt_len:, :, :]
+            if txt_len > 0:
+                img_q, txt_q = q[:, :-txt_len, :, :], q[:, -txt_len:, :, :]
+                img_k, txt_k = k[:, :-txt_len, :, :], k[:, -txt_len:, :, :]
+            else:
+                img_q, txt_q = q, None
+                img_k, txt_k = k, None
             img_qq, img_kk = apply_rotary_emb(
                 img_q, img_k, freqs_cis, head_first=False)
             assert (
                 img_qq.shape == img_q.shape and img_kk.shape == img_k.shape
             ), f"img_kk: {img_qq.shape}, img_q: {img_q.shape}, img_kk: {img_kk.shape}, img_k: {img_k.shape}"
             img_q, img_k = img_qq, img_kk
-            q = torch.cat((img_q, txt_q), dim=1)
-            k = torch.cat((img_k, txt_k), dim=1)
+            if txt_q is not None:
+                q = torch.cat((img_q, txt_q), dim=1)
+            else:
+                q = img_q
+            if txt_k is not None:
+                k = torch.cat((img_k, txt_k), dim=1)
+            else:
+                k = img_k
 
         # Compute attention.
         assert (
@@ -473,6 +484,221 @@ class MMSingleStreamBlock(nn.Module):
             return output
         else:
             return x + apply_gate(output, gate=mod_gate)
+
+class MMCrossStreamBlock(nn.Module):
+    """
+    Cross-attention block: update x_q by attending to x_kv
+
+    Now supports different hidden sizes:
+      - q_hidden_size for query stream (and attention/model width)
+      - kv_hidden_size for key/value input stream
+
+    Projections:
+      - linear_q_mlp: q_hidden_size -> (q_hidden_size + mlp_hidden_dim)
+      - linear_kv:    kv_hidden_size -> (2 * q_hidden_size)  # produces K,V in q-width
+    """
+
+    def __init__(
+        self,
+        q_hidden_size: int,
+        kv_hidden_size: int,
+        heads_num: int,
+        mlp_width_ratio: float = 4.0,
+        mlp_act_type: str = "gelu_tanh",
+        qk_norm: bool = True,
+        qk_norm_type: str = "rms",
+        qkv_bias: bool = False,
+        dtype=None,
+        device=None,
+    ):
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+
+        self.q_hidden_size = q_hidden_size
+        self.kv_hidden_size = kv_hidden_size
+        self.heads_num = heads_num
+
+        assert q_hidden_size % heads_num == 0, "q_hidden_size must be divisible by heads_num"
+        head_dim = q_hidden_size // heads_num
+
+        self.mlp_hidden_dim = int(q_hidden_size * mlp_width_ratio)
+
+        # Query-side packed projection: Q + MLP-in
+        self.linear_q_mlp = nn.Linear(
+            q_hidden_size,
+            q_hidden_size + self.mlp_hidden_dim,
+            bias=True,
+            **factory_kwargs,
+        )
+
+        # KV-side projection: K,V (project KV stream into q-width)
+        self.linear_kv = nn.Linear(
+            kv_hidden_size,
+            2 * q_hidden_size,
+            bias=qkv_bias,
+            **factory_kwargs,
+        )
+
+        # Output projection from (attn_out + mlp_out) -> q_hidden_size
+        self.linear_out = nn.Linear(
+            q_hidden_size + self.mlp_hidden_dim,
+            q_hidden_size,
+            bias=True,
+            **factory_kwargs,
+        )
+
+        # QK norm (operates on head_dim, after reshaping to [B, L, H, head_dim])
+        qk_norm_layer = get_norm_layer(qk_norm_type)
+        self.q_norm = (
+            qk_norm_layer(head_dim, elementwise_affine=True, eps=1e-6, **factory_kwargs)
+            if qk_norm
+            else nn.Identity()
+        )
+        self.k_norm = (
+            qk_norm_layer(head_dim, elementwise_affine=True, eps=1e-6, **factory_kwargs)
+            if qk_norm
+            else nn.Identity()
+        )
+
+        # Pre norms (match each stream width)
+        self.pre_norm_q = nn.LayerNorm(
+            q_hidden_size, elementwise_affine=False, eps=1e-6, **factory_kwargs
+        )
+        self.pre_norm_kv = nn.LayerNorm(
+            kv_hidden_size, elementwise_affine=False, eps=1e-6, **factory_kwargs
+        )
+
+        self.mlp_act = get_activation_layer(mlp_act_type)()
+
+        # Modulation:
+        # - query: shift, scale, gate (q_hidden_size)
+        self.mod_q = ModulateDiT(
+            q_hidden_size, factor=3, act_layer=get_activation_layer("silu"), **factory_kwargs
+        )
+        # - kv: shift, scale (kv_hidden_size) since it modulates x_kv before projection
+        self.mod_kv = ModulateDiT(
+            kv_hidden_size, factor=2, act_layer=get_activation_layer("silu"), **factory_kwargs
+        )
+
+        self.hybrid_seq_parallel_attn = None
+
+    def forward(
+        self,
+        x_q: torch.Tensor,      # [B, Lq, q_hidden_size]
+        x_kv: torch.Tensor,     # [B, Lkv, kv_hidden_size]
+        vec_q: torch.Tensor,
+        vec_kv: torch.Tensor,
+        cu_seqlens_q=None,
+        cu_seqlens_kv=None,
+        max_seqlen_q=None,
+        max_seqlen_kv=None,
+        freqs_cis_q=None,
+        freqs_cis_kv=None,
+        condition_type: str = None,
+        token_replace_vec: torch.Tensor = None,
+        frist_frame_token_num: int = None,
+    ) -> torch.Tensor:
+
+        # ------------------ get modulation params ------------------
+        if condition_type == "token_replace":
+            q_mod, tr_q_mod = self.mod_q(
+                vec_q, condition_type=condition_type, token_replace_vec=token_replace_vec
+            )
+            q_shift, q_scale, q_gate = q_mod.chunk(3, dim=-1)
+            tr_q_shift, tr_q_scale, tr_q_gate = tr_q_mod.chunk(3, dim=-1)
+
+            kv_mod, tr_kv_mod = self.mod_kv(
+                vec_kv, condition_type=condition_type, token_replace_vec=token_replace_vec
+            )
+            kv_shift, kv_scale = kv_mod.chunk(2, dim=-1)
+            tr_kv_shift, tr_kv_scale = tr_kv_mod.chunk(2, dim=-1)
+        else:
+            q_shift, q_scale, q_gate = self.mod_q(vec_q).chunk(3, dim=-1)
+            kv_shift, kv_scale = self.mod_kv(vec_kv).chunk(2, dim=-1)
+
+            tr_q_shift = tr_q_scale = tr_q_gate = None
+            tr_kv_shift = tr_kv_scale = None
+
+        # ------------------ apply modulation ------------------
+        if condition_type == "token_replace":
+            xq_mod = modulate(
+                self.pre_norm_q(x_q),
+                shift=q_shift,
+                scale=q_scale,
+                condition_type=condition_type,
+                tr_shift=tr_q_shift,
+                tr_scale=tr_q_scale,
+                frist_frame_token_num=frist_frame_token_num,
+            )
+            xkv_mod = modulate(
+                self.pre_norm_kv(x_kv),
+                shift=kv_shift,
+                scale=kv_scale,
+                condition_type=condition_type,
+                tr_shift=tr_kv_shift,
+                tr_scale=tr_kv_scale,
+                frist_frame_token_num=frist_frame_token_num,
+            )
+        else:
+            xq_mod = modulate(self.pre_norm_q(x_q), shift=q_shift, scale=q_scale)
+            xkv_mod = modulate(self.pre_norm_kv(x_kv), shift=kv_shift, scale=kv_scale)
+
+        # ------------------ projections ------------------
+        q_and_mlp = self.linear_q_mlp(xq_mod)
+        q, mlp_in = torch.split(
+            q_and_mlp, [self.q_hidden_size, self.mlp_hidden_dim], dim=-1
+        )
+
+        k, v = torch.split(self.linear_kv(xkv_mod), [self.q_hidden_size, self.q_hidden_size], dim=-1)
+
+        q = rearrange(q, "B L (H D) -> B L H D", H=self.heads_num)
+        k = rearrange(k, "B L (H D) -> B L H D", H=self.heads_num)
+        v = rearrange(v, "B L (H D) -> B L H D", H=self.heads_num)
+
+        # QK norm
+        q = self.q_norm(q).to(v)
+        k = self.k_norm(k).to(v)
+
+        # ------------------ RoPE (optional) ------------------
+        if freqs_cis_q is not None:
+            q, _ = apply_rotary_emb(q, q, freqs_cis_q, head_first=False)
+        if freqs_cis_kv is not None:
+            k, _ = apply_rotary_emb(k, k, freqs_cis_kv, head_first=False)
+
+        # ------------------ attention ------------------
+        if self.hybrid_seq_parallel_attn is None:
+            attn = attention(
+                q, k, v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=cu_seqlens_kv,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_kv=max_seqlen_kv,
+                batch_size=x_q.shape[0],
+            )
+        else:
+            attn = parallel_attention(
+                self.hybrid_seq_parallel_attn,
+                q, k, v,
+                img_q_len=q.shape[1],
+                img_kv_len=k.shape[1],
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=cu_seqlens_kv,
+            )
+
+        # ------------------ output + gated residual ------------------
+        out = self.linear_out(torch.cat((attn, self.mlp_act(mlp_in)), dim=2))
+
+        if condition_type == "token_replace":
+            return x_q + apply_gate(
+                out,
+                gate=q_gate,
+                condition_type=condition_type,
+                tr_gate=tr_q_gate,
+                frist_frame_token_num=frist_frame_token_num,
+            )
+        return x_q + apply_gate(out, gate=q_gate)
+
+
 
 
 class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
@@ -550,6 +776,8 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
         patch_sizes: Optional[List[List[int]]] = None,
+        second_branch_mm_blocks_depth: int = 0,
+        second_branch_transformer_config: Optional[TransformerBranchConfig] = None,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -671,6 +899,106 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                 for _ in range(mm_single_blocks_depth)
             ]
         )
+
+        if second_branch_transformer_config is not None:
+            if second_branch_transformer_config.scheduler is not None:
+                self.cross_attn_blocks = nn.ModuleList()
+                self.double_branch_scheduler = second_branch_transformer_config.scheduler
+                #assert if scheduler is unique
+                assert len(self.double_branch_scheduler) == len(set(self.double_branch_scheduler)), \
+                    f"Scheduler {self.double_branch_scheduler} contains duplicate indices."
+                prev_key_block = -1
+                prev_non_key_block = -1
+                for edge in self.double_branch_scheduler:
+                    u, v = edge
+                    # there are 2 categories, > 0 and <= 0
+                    # u, v must be in differrent categories
+                    # assert their category
+                    assert (u > 0 and v <= 0) or (u <= 0 and v > 0), \
+                        f"Scheduler {self.double_branch_scheduler} contains invalid edge ({u}, {v}). "\
+                        f"u and v must be in different categories (>0 and <=0)."
+                    assert abs(max(u, v)) < mm_double_blocks_depth + mm_single_blocks_depth, \
+                        f"Scheduler {self.double_branch_scheduler} is invalid. "\
+                        f"Block index of first branch: {max(u, v)} exceeds the total number of blocks {mm_double_blocks_depth + mm_single_blocks_depth}."
+                    assert abs(min(u, v)) < second_branch_mm_blocks_depth, \
+                        f"Scheduler {self.double_branch_scheduler} is invalid. "\
+                        f"Block index of second branch: {min(u, v)} exceeds the total number of blocks {second_branch_mm_blocks_depth}."
+
+                    if u > 0:
+                        assert u >= prev_key_block and -v >= prev_non_key_block, \
+                            f"Scheduler {self.double_branch_scheduler} is invalid. "\
+                            f"Blocks must be in non decreasing order. Got u: {u}, prev_key_block: {prev_key_block}, v: {v}, prev_non_key_block: {prev_non_key_block}."
+                        prev_key_block = u
+                        prev_non_key_block = -v
+                    else:
+                        assert -u >= prev_non_key_block and v >= prev_key_block, \
+                            f"Scheduler {self.double_branch_scheduler} is invalid. "\
+                            f"Blocks must be in non decreasing order. Got u: {u}, prev_non_key_block: {prev_non_key_block}, u: {u}, prev_key_block: {prev_key_block}: {prev_key_block}."
+                        prev_non_key_block = -u
+                        prev_key_block = v
+                    
+                for edge in self.double_branch_scheduler:
+                    u, v = edge
+                    if u > 0: # cross-attention between key after block u (query) and non-key after block v (key/value)
+                        self.cross_attn_blocks.append(
+                            MMCrossStreamBlock(
+                                q_hidden_size=self.hidden_size,
+                                kv_hidden_size=second_branch_transformer_config.hidden_size,
+                                heads_num=self.heads_num,
+                                mlp_width_ratio=mlp_width_ratio,
+                                mlp_act_type=mlp_act_type,
+                                qk_norm=qk_norm,
+                                qk_norm_type=qk_norm_type,
+                                qkv_bias=qkv_bias,
+                                **factory_kwargs,
+                            )
+                        )
+                    else: # cross-attention between non-key after block u (query) and key after block v (key/value)
+                        self.cross_attn_blocks.append(
+                            MMCrossStreamBlock(
+                                q_hidden_size=second_branch_transformer_config.hidden_size,
+                                kv_hidden_size=self.hidden_size,
+                                heads_num=second_branch_transformer_config.heads_num,
+                                mlp_width_ratio=second_branch_transformer_config.mlp_width_ratio,
+                                mlp_act_type=second_branch_transformer_config.mlp_act_type,
+                                qk_norm=second_branch_transformer_config.qk_norm,
+                                qk_norm_type=second_branch_transformer_config.qk_norm_type,
+                                qkv_bias=second_branch_transformer_config.qkv_bias,
+                                **factory_kwargs,
+                            )
+                        )
+                
+                self.double_branch_scheduler.append((-1, -1)) # add a last layer to avoid missing the last blocks when no cross-attention at the end
+            
+            self.proj_to_second_branch = nn.Linear(
+                self.hidden_size,
+                second_branch_transformer_config.hidden_size,
+                **factory_kwargs,
+            )
+            self.unproj_from_second_branch = nn.Linear(
+                second_branch_transformer_config.hidden_size,
+                self.hidden_size,
+                **factory_kwargs,
+            )
+            self.time_in_second_branch = TimestepEmbedder(
+                second_branch_transformer_config.hidden_size, get_activation_layer("silu"), **factory_kwargs
+            )
+
+            self.second_branch_blocks = nn.ModuleList(
+                [
+                    MMSingleStreamBlock(
+                        second_branch_transformer_config.hidden_size,
+                        second_branch_transformer_config.heads_num,
+                        mlp_width_ratio=second_branch_transformer_config.mlp_width_ratio,
+                        mlp_act_type=second_branch_transformer_config.mlp_act_type,
+                        qk_norm=second_branch_transformer_config.qk_norm,
+                        qk_norm_type=second_branch_transformer_config.qk_norm_type,
+                        **factory_kwargs,
+                    )
+                    for _ in range(second_branch_mm_blocks_depth)
+                ]
+            )
+            self.use_second_branch = True
 
         self.final_layer = FinalLayer(
             self.hidden_size,
@@ -807,6 +1135,27 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
 
         if self.patch_sizes is not None:
             img, patch_indices = self.img_in(img, indices=indices)
+            assert torch.all(patch_indices == patch_indices[0:1]), \
+                "patch_indices differ across batch: cannot index shared RoPE [N,*] with batch-dependent masks."
+            if self.use_second_branch:
+                B, N, dim = img.shape
+
+                non_keyframe_mask = (patch_indices != 0) # first patch size corresponds to keyframe, [B, N]
+                K = int(non_keyframe_mask.sum(dim=1)[0].item())  # It is guaranteed that for each batch, there is exactly K tokens belong to non-keyframes.
+                assert torch.all(non_keyframe_mask.sum(dim=1) == K)
+                img_second_branch = img[non_keyframe_mask].reshape(B, K, dim)
+                img_second_branch = self.proj_to_second_branch(img_second_branch)
+                freqs_cos_second_branch = freqs_cos[non_keyframe_mask[0].cpu()]
+                freqs_sin_second_branch = freqs_sin[non_keyframe_mask[0].cpu()]
+
+                keyframe_mask = (patch_indices == 0).to(img.device) # first patch size corresponds to keyframe
+                K = int(keyframe_mask.sum(dim=1)[0].item()) # It is guaranteed that for each batch, there is exactly K tokens belong to keyframes.
+                assert torch.all(keyframe_mask.sum(dim=1) == K)
+                img = img[keyframe_mask].reshape(B, K, dim)
+                freqs_cos = freqs_cos[keyframe_mask[0].cpu()]
+                freqs_sin = freqs_sin[keyframe_mask[0].cpu()]
+
+                vec_second_branch = self.time_in_second_branch(t)
         else:
             img = self.img_in(img)
         
@@ -819,126 +1168,297 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             raise NotImplementedError(
                 f"Unsupported text_projection: {self.text_projection}"
             )
+        
+        if self.patch_sizes is not None and self.use_second_branch:
+            prev_first_branch_index = -1
+            prev_second_branch_index = -1
+            no_text_mask = torch.zeros(
+                (img.shape[0], 0),
+                dtype=text_mask.dtype,
+                device=text_mask.device,
+            )
+            first_branch_cu_seqlens = get_cu_seqlens(no_text_mask, img.shape[1])
+            first_branch_text_cu_seqlens = get_cu_seqlens(text_mask, img.shape[1])
+            second_branch_cu_seqlens = get_cu_seqlens(no_text_mask, img_second_branch.shape[1])
 
-        txt_seq_len = txt.shape[1]
-        img_seq_len = img.shape[1]
+            first_branch_max_seqlen = img.shape[1]
+            first_branch_text_max_seqlen = img.shape[1] + txt.shape[1]
+            second_branch_max_seqlen = img_second_branch.shape[1]
+            txt_seq_len = txt.shape[1]
 
-        # Compute cu_squlens and max_seqlen for flash attention
-        cu_seqlens_q = get_cu_seqlens(text_mask, img_seq_len)
-        cu_seqlens_kv = cu_seqlens_q
-        max_seqlen_q = img_seq_len + txt_seq_len
-        max_seqlen_kv = max_seqlen_q
+            last_img, last_txt, last_x = None, None, None
+            last_img_second_branch = None
 
-        if self.use_context_block:
-            cond_seq_len = condition.shape[1]
-            cu_seqlens_q_cond = get_cu_seqlens(text_mask, cond_seq_len)
-            cu_seqlens_kv_cond = cu_seqlens_q_cond
-            max_seqlen_q_cond = cond_seq_len + txt_seq_len
-            max_seqlen_kv_cond = max_seqlen_q_cond
+            for cross_attn_id, edge in enumerate(self.double_branch_scheduler):
+                u, v = edge
+                if u == -1 and v == -1:
+                    u = len(self.double_blocks) + len(self.single_blocks) - 1
+                    v = -len(self.second_branch_blocks) + 1
+                    last_layer = True
+                else:
+                    last_layer = False
+                if u > 0:
+                    first_branch_index = u
+                    second_branch_index = -v
+                else:
+                    first_branch_index = v
+                    second_branch_index = -u
+                #-----------------------First branch blocks------------------------#
+                for layer_num in range(prev_first_branch_index + 1, first_branch_index + 1):
+                    if last_img is None:
+                        last_img = img
+                    if last_txt is None:
+                        last_txt = txt
+                    if last_x is None and layer_num >= len(self.double_blocks):
+                        last_x = torch.cat((last_img, last_txt), 1)
+                    if layer_num < len(self.double_blocks):
+                        block = self.double_blocks[layer_num]
+                        double_block_args = [
+                            last_img,
+                            last_txt,
+                            vec,
+                            first_branch_text_cu_seqlens,
+                            first_branch_text_cu_seqlens,
+                            first_branch_text_max_seqlen,
+                            first_branch_text_max_seqlen,
+                            (freqs_cos, freqs_sin),
+                            self.i2v_condition_type,
+                            token_replace_vec,
+                            frist_frame_token_num,
+                        ]
+                        print(f"First branch double block {layer_num} processing")
+                        if self.training and self.gradient_checkpoint and \
+                                (self.gradient_checkpoint_layers == -1 or layer_num < self.gradient_checkpoint_layers):
+                            # print(f'gradient checkpointing...')
+                            img, txt = torch.utils.checkpoint.checkpoint(
+                                ckpt_wrapper(block), *double_block_args, use_reentrant=False)
+                        else:
+                            img, txt = block(*double_block_args)
+                        last_img = img
+                        last_txt = txt
+                    else:
+                        block = self.single_blocks[layer_num - len(self.double_blocks)]
+                        single_block_args = [
+                            last_x,
+                            vec,
+                            txt_seq_len,
+                            first_branch_text_cu_seqlens,
+                            first_branch_text_cu_seqlens,
+                            first_branch_text_max_seqlen,
+                            first_branch_text_max_seqlen,
+                            (freqs_cos, freqs_sin),
+                            self.i2v_condition_type,
+                            token_replace_vec,
+                            frist_frame_token_num,
+                        ]
+                        print(f"First branch single block {layer_num - len(self.double_blocks)} processing")
+                        if self.training and self.gradient_checkpoint and \
+                                (self.gradient_checkpoint_layers == -1 or layer_num < self.gradient_checkpoint_layers):
+                            # print(f'gradient checkpointing...')
+                            x = torch.utils.checkpoint.checkpoint(
+                                ckpt_wrapper(block), *single_block_args, use_reentrant=False)
+                        else:
+                            x = block(*single_block_args)
+                        last_x = x
+                        last_img = last_x[:, :img.shape[1], ...]
+                #-----------------------Second branch blocks------------------------#
+                for layer_num in range(prev_second_branch_index + 1, second_branch_index + 1):
+                    if last_img_second_branch is None:
+                        last_img_second_branch = img_second_branch
+                    block = self.second_branch_blocks[layer_num]
+                    single_block_args = [
+                        last_img_second_branch,
+                        vec_second_branch,
+                        0,
+                        second_branch_cu_seqlens,
+                        second_branch_cu_seqlens,
+                        second_branch_max_seqlen,
+                        second_branch_max_seqlen,
+                        (freqs_cos_second_branch, freqs_sin_second_branch),
+                        self.i2v_condition_type,
+                        token_replace_vec,
+                        frist_frame_token_num,
+                    ]
+                    print(f"Second branch single block {layer_num} processing")
+                    if self.training and self.gradient_checkpoint and \
+                            (self.gradient_checkpoint_layers == -1 or layer_num < self.gradient_checkpoint_layers):
+                        # print(f'gradient checkpointing...')
+                        img_second_branch = torch.utils.checkpoint.checkpoint(
+                            ckpt_wrapper(block), *single_block_args, use_reentrant=False)
+                    else:
+                        img_second_branch = block(*single_block_args)
+                    last_img_second_branch = img_second_branch
+                prev_first_branch_index = first_branch_index
+                prev_second_branch_index = second_branch_index
+                #-----------------------Cross attention------------------------#
+                if not last_layer:
+                    if u > 0:
+                        # cross-attention between key after block u (query) and non-key after block v (key/value)
+                        print(f"Cross attention block {cross_attn_id} processing: keyframe {u} as query, non-keyframe {v} as key/value")
+                        last_img = self.cross_attn_blocks[cross_attn_id](
+                            last_img,
+                            last_img_second_branch,
+                            vec,
+                            vec_second_branch,
+                            cu_seqlens_q=first_branch_cu_seqlens,
+                            cu_seqlens_kv=second_branch_cu_seqlens,
+                            max_seqlen_q=first_branch_max_seqlen,
+                            max_seqlen_kv=second_branch_max_seqlen,
+                            freqs_cis_q=(freqs_cos, freqs_sin),
+                            freqs_cis_kv=(freqs_cos_second_branch, freqs_sin_second_branch),
+                            condition_type=self.i2v_condition_type,
+                            token_replace_vec=token_replace_vec,
+                            frist_frame_token_num=frist_frame_token_num,
+                        )
+                    else:
+                        # cross-attention between non-key after block u (query) and key after block v (key/value)
+                        print(f"Cross attention block {cross_attn_id} processing: non-keyframe {u} as query, keyframe {v} as key/value")
+                        last_img_second_branch = self.cross_attn_blocks[cross_attn_id](
+                            last_img_second_branch,
+                            last_img,
+                            vec_second_branch,
+                            vec,
+                            cu_seqlens_q=second_branch_cu_seqlens,
+                            cu_seqlens_kv=first_branch_cu_seqlens,
+                            max_seqlen_q=second_branch_max_seqlen,
+                            max_seqlen_kv=first_branch_max_seqlen,
+                            freqs_cis_q=(freqs_cos_second_branch, freqs_sin_second_branch),
+                            freqs_cis_kv=(freqs_cos, freqs_sin),
+                            condition_type=self.i2v_condition_type,
+                            token_replace_vec=token_replace_vec,
+                            frist_frame_token_num=frist_frame_token_num,
+                        )
+                    if last_x is not None:
+                        # last_x is concatenation of [img, txt]. We need to keep the updated text 
+                        # (which resides in last_x) and combine it with the cross-attended last_img.
+                        current_txt = last_x[:, last_img.shape[1]:, ...]
+                        last_x = torch.cat((last_img, current_txt), dim=1)
+            last_img_second_branch = self.unproj_from_second_branch(last_img_second_branch)
+            img = self.merge_back(
+                last_img,
+                last_img_second_branch,
+                patch_indices
+            )
+        else:
+            txt_seq_len = txt.shape[1]
+            img_seq_len = img.shape[1]
 
-            # ---------------------------- Context Block ------------------------------
-            context_block_args = [
-                condition,
-                txt,
-                vec,
-                cu_seqlens_q_cond,
-                cu_seqlens_kv_cond,
-                max_seqlen_q_cond,
-                max_seqlen_kv_cond,
-                (freqs_cos_cond, freqs_sin_cond),
-                # (freqs_cos, freqs_sin),
-                self.i2v_condition_type,
-                token_replace_vec,
-                frist_frame_token_num,
-            ]
-            condition1, txt1 = self.context_block1(*context_block_args)
+            # Compute cu_squlens and max_seqlen for flash attention
+            cu_seqlens_q = get_cu_seqlens(text_mask, img_seq_len)
+            cu_seqlens_kv = cu_seqlens_q
+            max_seqlen_q = img_seq_len + txt_seq_len
+            max_seqlen_kv = max_seqlen_q
 
-            condition2 = torch.cat((condition1, txt1), 1)
-            context_block_args = [
-                condition2,
-                vec,
-                txt_seq_len,
-                cu_seqlens_q_cond,
-                cu_seqlens_kv_cond,
-                max_seqlen_q_cond,
-                max_seqlen_kv_cond,
-                (freqs_cos_cond, freqs_sin_cond),
-                # (freqs_cos, freqs_sin),
-                self.i2v_condition_type,
-                token_replace_vec,
-                frist_frame_token_num,
-            ]
-            condition2 = self.context_block2(*context_block_args)
+            if self.use_context_block:
+                cond_seq_len = condition.shape[1]
+                cu_seqlens_q_cond = get_cu_seqlens(text_mask, cond_seq_len)
+                cu_seqlens_kv_cond = cu_seqlens_q_cond
+                max_seqlen_q_cond = cond_seq_len + txt_seq_len
+                max_seqlen_kv_cond = max_seqlen_q_cond
 
-            condition1 = self.zero_linear1(condition1)
-            condition2 = self.zero_linear2(condition2)
+                # ---------------------------- Context Block ------------------------------
+                context_block_args = [
+                    condition,
+                    txt,
+                    vec,
+                    cu_seqlens_q_cond,
+                    cu_seqlens_kv_cond,
+                    max_seqlen_q_cond,
+                    max_seqlen_kv_cond,
+                    (freqs_cos_cond, freqs_sin_cond),
+                    # (freqs_cos, freqs_sin),
+                    self.i2v_condition_type,
+                    token_replace_vec,
+                    frist_frame_token_num,
+                ]
+                condition1, txt1 = self.context_block1(*context_block_args)
 
-            condition2 = torch.cat(
-                (torch.zeros_like(img)[:, :-condition1.shape[1]], condition2), dim=1)
-            condition1 = torch.cat(
-                (torch.zeros_like(img)[:, :-condition1.shape[1]], condition1), dim=1)
-
-        freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
-        # --------------------- Pass through DiT blocks ------------------------
-        for layer_num, block in enumerate(self.double_blocks):
-            double_block_args = [
-                img,
-                txt,
-                vec,
-                cu_seqlens_q,
-                cu_seqlens_kv,
-                max_seqlen_q,
-                max_seqlen_kv,
-                freqs_cis,
-                self.i2v_condition_type,
-                token_replace_vec,
-                frist_frame_token_num,
-            ]
-
-            if self.training and self.gradient_checkpoint and \
-                    (self.gradient_checkpoint_layers == -1 or layer_num < self.gradient_checkpoint_layers):
-                # print(f'gradient checkpointing...')
-                img, txt = torch.utils.checkpoint.checkpoint(
-                    ckpt_wrapper(block), *double_block_args, use_reentrant=False)
-                if self.use_context_block:
-                    img += condition1
-            else:
-                img, txt = block(*double_block_args)
-                if self.use_context_block:
-                    img += condition1
-
-        # Merge txt and img to pass through single stream blocks.
-        x = torch.cat((img, txt), 1)
-
-        if len(self.single_blocks) > 0:
-            for _, block in enumerate(self.single_blocks):
-                single_block_args = [
-                    x,
+                condition2 = torch.cat((condition1, txt1), 1)
+                context_block_args = [
+                    condition2,
                     vec,
                     txt_seq_len,
+                    cu_seqlens_q_cond,
+                    cu_seqlens_kv_cond,
+                    max_seqlen_q_cond,
+                    max_seqlen_kv_cond,
+                    (freqs_cos_cond, freqs_sin_cond),
+                    # (freqs_cos, freqs_sin),
+                    self.i2v_condition_type,
+                    token_replace_vec,
+                    frist_frame_token_num,
+                ]
+                condition2 = self.context_block2(*context_block_args)
+
+                condition1 = self.zero_linear1(condition1)
+                condition2 = self.zero_linear2(condition2)
+
+                condition2 = torch.cat(
+                    (torch.zeros_like(img)[:, :-condition1.shape[1]], condition2), dim=1)
+                condition1 = torch.cat(
+                    (torch.zeros_like(img)[:, :-condition1.shape[1]], condition1), dim=1)
+
+            freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
+            # --------------------- Pass through DiT blocks ------------------------
+            for layer_num, block in enumerate(self.double_blocks):
+                double_block_args = [
+                    img,
+                    txt,
+                    vec,
                     cu_seqlens_q,
                     cu_seqlens_kv,
                     max_seqlen_q,
                     max_seqlen_kv,
-                    (freqs_cos, freqs_sin),
+                    freqs_cis,
                     self.i2v_condition_type,
                     token_replace_vec,
                     frist_frame_token_num,
                 ]
 
                 if self.training and self.gradient_checkpoint and \
-                        (self.gradient_checkpoint_layers == -1 or \
-                        layer_num + len(self.double_blocks) < self.gradient_checkpoint_layers):
-                    x = torch.utils.checkpoint.checkpoint(ckpt_wrapper(
-                        block), *single_block_args, use_reentrant=False)
+                        (self.gradient_checkpoint_layers == -1 or layer_num < self.gradient_checkpoint_layers):
+                    # print(f'gradient checkpointing...')
+                    img, txt = torch.utils.checkpoint.checkpoint(
+                        ckpt_wrapper(block), *double_block_args, use_reentrant=False)
                     if self.use_context_block:
-                        x += condition2
+                        img += condition1
                 else:
-                    x = block(*single_block_args)
+                    img, txt = block(*double_block_args)
                     if self.use_context_block:
-                        x += condition2
+                        img += condition1
 
-        img = x[:, :img_seq_len, ...]
+            # Merge txt and img to pass through single stream blocks.
+            x = torch.cat((img, txt), 1)
+
+            if len(self.single_blocks) > 0:
+                for _, block in enumerate(self.single_blocks):
+                    single_block_args = [
+                        x,
+                        vec,
+                        txt_seq_len,
+                        cu_seqlens_q,
+                        cu_seqlens_kv,
+                        max_seqlen_q,
+                        max_seqlen_kv,
+                        (freqs_cos, freqs_sin),
+                        self.i2v_condition_type,
+                        token_replace_vec,
+                        frist_frame_token_num,
+                    ]
+
+                    if self.training and self.gradient_checkpoint and \
+                            (self.gradient_checkpoint_layers == -1 or \
+                            layer_num + len(self.double_blocks) < self.gradient_checkpoint_layers):
+                        x = torch.utils.checkpoint.checkpoint(ckpt_wrapper(
+                            block), *single_block_args, use_reentrant=False)
+                        if self.use_context_block:
+                            x += condition2
+                    else:
+                        x = block(*single_block_args)
+                        if self.use_context_block:
+                            x += condition2
+
+            img = x[:, :img_seq_len, ...]
 
         # ---------------------------- Final layer ------------------------------
         # (N, T, patch_size ** 2 * out_channels)
@@ -959,6 +1479,26 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             out["x"] = img
             return out
         return img
+    
+    def merge_back(
+        self,
+        img_key: torch.Tensor,          # [B, K_key, D]
+        img_nonkey: torch.Tensor,       # [B, K_nonkey, D]
+        patch_indices_full: torch.Tensor # [B, N]
+    ) -> torch.Tensor:
+        B, N = patch_indices_full.shape
+        D = img_key.shape[-1]
+
+        key_mask = (patch_indices_full == 0)       # [B, N]
+        nonkey_mask = ~key_mask                    # [B, N]
+
+        out = img_key.new_empty((B, N, D))         # [B, N, D]
+
+        # boolean assignment expects flattened RHS: (#true, D)
+        out[key_mask] = img_key.reshape(-1, D)
+        out[nonkey_mask] = img_nonkey.reshape(-1, D)
+
+        return out
 
     def unpatchify(self, x, t, h, w):
         """
@@ -1131,6 +1671,14 @@ HUNYUAN_VIDEO_CONFIG = {
         "mlp_width_ratio": 4,
         "guidance_embed": True,
     },
+    "HYVideo-M/2": {
+        "mm_double_blocks_depth": 8,
+        "mm_single_blocks_depth": 16,
+        "rope_dim_list": [24, 84, 84],
+        "hidden_size": 960,
+        "heads_num": 5,
+        "mlp_width_ratio": 4,
+    },
     "HYVideo-S/2": {
         "mm_double_blocks_depth": 6,
         "mm_single_blocks_depth": 12,
@@ -1138,6 +1686,66 @@ HUNYUAN_VIDEO_CONFIG = {
         "hidden_size": 480,
         "heads_num": 5,
         "mlp_width_ratio": 4,
+    },
+    "HYVideo-S/2-2branch": {
+        "mm_double_blocks_depth": 6,
+        "mm_single_blocks_depth": 12,
+        "rope_dim_list": [12, 42, 42],
+        "hidden_size": 480,
+        "heads_num": 5,
+        "mlp_width_ratio": 4,
+        "second_branch_mm_blocks_depth": 4,
+        "second_branch_transformer_config": TransformerBranchConfig(
+            hidden_size=480,
+            heads_num=5,
+            mlp_width_ratio=4,
+            scheduler=[],
+        ),
+    },
+    "HYVideo-T/2-2branch-cross_attn": {
+        "mm_double_blocks_depth": 20,
+        "mm_single_blocks_depth": 40,
+        "rope_dim_list": [16, 56, 56],
+        "hidden_size": 3072,
+        "heads_num": 24,
+        "mlp_width_ratio": 4,
+        "second_branch_mm_blocks_depth": 18,
+        "second_branch_transformer_config": TransformerBranchConfig(
+            hidden_size=512,
+            heads_num=4,
+            mlp_width_ratio=4,
+            scheduler=[(0, 3), (-3, 11), (15, -4), (-5, 19), (-6, 23), (-9, 31), (35, -10), (-11, 39), (-12, 43), (-15, 51), (55, -16), (-17, 59)],
+        ),
+    },
+    "HYVideo-S/2-2branch-cross_attn": {
+        "mm_double_blocks_depth": 6,
+        "mm_single_blocks_depth": 12,
+        "rope_dim_list": [12, 42, 42],
+        "hidden_size": 480,
+        "heads_num": 5,
+        "mlp_width_ratio": 4,
+        "second_branch_mm_blocks_depth": 6,
+        "second_branch_transformer_config": TransformerBranchConfig(
+            hidden_size=480,
+            heads_num=5,
+            mlp_width_ratio=4,
+            scheduler=[(0, 2), (-1, 5), (-2, 8), (-3, 11), (-4, 14), (-5, 17)],
+        ),
+    },
+    "HYVideo-S/2-2branch-cross_attn-full": {
+        "mm_double_blocks_depth": 6,
+        "mm_single_blocks_depth": 12,
+        "rope_dim_list": [12, 42, 42],
+        "hidden_size": 480,
+        "heads_num": 5,
+        "mlp_width_ratio": 4,
+        "second_branch_mm_blocks_depth": 18,
+        "second_branch_transformer_config": TransformerBranchConfig(
+            hidden_size=480,
+            heads_num=5,
+            mlp_width_ratio=4,
+            scheduler=[(0, 2), (2, -4), (-4, 6), (6, -8), (-8, 10), (10, -12), (-12, 14), (14, -16), (-16, 17)],
+        ),
     },
     "HYVideo-S/2-4x4": {
         "mm_double_blocks_depth": 6,

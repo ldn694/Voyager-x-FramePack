@@ -36,6 +36,8 @@ import torchvision.transforms as T
 from voyager.modules.lora_layers import apply_lora_to_hunyuan_video, load_lora_state_dict
 from voyager.modules.custom_patch_embed import apply_patch_adapter_to_hunyuan_video, load_patch_adapter_state_dict
 from voyager.modules.multi_kernel import apply_multikernel_to_hunyuan_video, load_multikernel_state_dict
+from voyager.modules.double_branch import apply_double_branch_to_hunyuan_video, load_double_branch_state_dict
+from voyager.modules.transformer_branch_config import get_transformer_branch_config_from_args
 
 try:
     import xfuser
@@ -271,6 +273,16 @@ def parallelize_transformer(pipe):
     new_forward = new_forward.__get__(transformer)
     transformer.forward = new_forward
 
+def load_vae_only(args, device):
+    vae, _, s_ratio, t_ratio = load_vae(
+        args.vae,
+        args.vae_precision,
+        logger=logger,
+        device=device
+    )
+    vae_kwargs = {"s_ratio": s_ratio, "t_ratio": t_ratio}
+    vae = vae.to(device)
+    return vae, vae_kwargs
 
 def load_models(args, device, logger, pretrained_model_path):
     factor_kwargs = {"device": device, "dtype": PRECISION_TO_TYPE[args.precision]}
@@ -294,13 +306,7 @@ def load_models(args, device, logger, pretrained_model_path):
     
     # model = model.to(device)
     if pretrained_model_path is not None:
-        if args.load_all:
-            logger.info(f"Loading all model states from {pretrained_model_path}...")
-            checkpoint = torch.load(pretrained_model_path, map_location="cpu", weights_only=False)
-            load_output = model.load_state_dict(checkpoint["model"], strict=False)
-            print("Missing keys:", load_output.missing_keys)
-            print("Unexpected keys:", load_output.unexpected_keys)
-        else:
+        if not args.load_all:
             model = load_state_dict(args, model, logger, pretrained_model_path)
 
     if args.use_lora and args.lora_path is not None:
@@ -337,6 +343,26 @@ def load_models(args, device, logger, pretrained_model_path):
             patch_sizes=multiple_kernels_args["kernel_sizes"] if "kernel_sizes" in multiple_kernels_args else [[1, 2, 2]],
         )
         load_multikernel_state_dict(model, multiple_kernels_ckpt["multi_kernel"], strict=False)
+    if args.use_double_branch and args.double_branch_path is not None:
+        logger.info(f"Loading Double Branch from {args.double_branch_path}...")
+        double_branch_ckpt = torch.load(args.double_branch_path, map_location="cpu", weights_only=False)
+        double_branch_args = double_branch_ckpt["args"]
+        print(double_branch_args)
+        apply_double_branch_to_hunyuan_video(
+            model, 
+            second_branch_config=get_transformer_branch_config_from_args(double_branch_args["second_branch_transformer_config"]),
+            second_branch_mm_blocks_depth=double_branch_args["second_branch_mm_blocks_depth"],
+            freeze_base=True,
+        )
+        load_double_branch_state_dict(model, double_branch_ckpt["double_branch"], strict=False)
+        
+    if pretrained_model_path is not None:
+        if args.load_all:
+            logger.info(f"Loading all model states from {pretrained_model_path}...")
+            checkpoint = torch.load(pretrained_model_path, map_location="cpu", weights_only=False)
+            load_output = model.load_state_dict(checkpoint["model"], strict=False)
+            print("Missing keys:", load_output.missing_keys)
+            print("Unexpected keys:", load_output.unexpected_keys)
 
     if hasattr(args, "train_from_scratch") and args.train_from_scratch:
         logger.info("Training from scratch, not loading any pre-trained weights.")
