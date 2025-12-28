@@ -1,6 +1,7 @@
 from typing import Sequence, Union, Dict
 import torch
 import torch.nn as nn
+from loguru import logger
 
 from .embed_layers import PatchEmbed, MultiPatchEmbed
 from .mlp_layers import FinalLayer, MultiFinalLayer
@@ -21,6 +22,7 @@ def apply_multikernel_to_hunyuan_video(
     device=None,
     dtype=None,
     freeze_base: bool = False,
+    copy_old_weights: bool = False,
 ) -> None:
     """
     Upgrade a vanilla HYVideoDiffusionTransformer to multi-kernel version.
@@ -89,10 +91,12 @@ def apply_multikernel_to_hunyuan_video(
         **factory_kwargs,
     )
 
-    with torch.no_grad():
-        new_img_in.projs[0].weight.copy_(old_conv.weight)
-        if bias and old_conv.bias is not None:
-            new_img_in.projs[0].bias.copy_(old_conv.bias)
+    if copy_old_weights:
+        logger.warning("Copying old img_in weights to multi-kernel img_in.")
+        with torch.no_grad():
+            new_img_in.projs[0].weight.copy_(old_conv.weight)
+            if bias and old_conv.bias is not None:
+                new_img_in.projs[0].bias.copy_(old_conv.bias)
 
     model.img_in = new_img_in
 
@@ -119,20 +123,22 @@ def apply_multikernel_to_hunyuan_video(
         **factory_kwargs,
     )
 
-    with torch.no_grad():
-        new_final.norm_final.load_state_dict(
-            old_final.norm_final.state_dict()
-        )
+    if copy_old_weights:
+        logger.warning("Copying old final_layer weights to multi-kernel final_layer.")
+        with torch.no_grad():
+            new_final.norm_final.load_state_dict(
+                old_final.norm_final.state_dict()
+            )
 
-        new_final.adaLN_modulation[1].weight.copy_(
-            old_final.adaLN_modulation[1].weight
-        )
-        new_final.adaLN_modulation[1].bias.copy_(
-            old_final.adaLN_modulation[1].bias
-        )
+            new_final.adaLN_modulation[1].weight.copy_(
+                old_final.adaLN_modulation[1].weight
+            )
+            new_final.adaLN_modulation[1].bias.copy_(
+                old_final.adaLN_modulation[1].bias
+            )
 
-        new_final.linears[0].weight.copy_(old_final.linear.weight)
-        new_final.linears[0].bias.copy_(old_final.linear.bias)
+            new_final.linears[0].weight.copy_(old_final.linear.weight)
+            new_final.linears[0].bias.copy_(old_final.linear.bias)
 
     model.final_layer = new_final
 

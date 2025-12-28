@@ -999,6 +999,8 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                 ]
             )
             self.use_second_branch = True
+        else:
+            self.use_second_branch = False
 
         self.final_layer = FinalLayer(
             self.hidden_size,
