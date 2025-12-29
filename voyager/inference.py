@@ -313,7 +313,7 @@ def load_models(args, device, logger, pretrained_model_path):
         logger.info(f"Loading LoRA from {args.lora_path}...")
         lora_ckpt = torch.load(args.lora_path, map_location="cpu", weights_only=False)
         lora_args = lora_ckpt["args"]
-        print(lora_args)
+        logger.info(lora_args)
         apply_lora_to_hunyuan_video(
             model,
             r=lora_args["lora_rank"] if "lora_rank" in lora_args else 4,
@@ -326,7 +326,7 @@ def load_models(args, device, logger, pretrained_model_path):
         logger.info(f"Loading Patch Adapter from {args.patch_adapter_path}...")
         patch_adapter_ckpt = torch.load(args.patch_adapter_path, map_location="cpu", weights_only=False)
         patch_adapter_args = patch_adapter_ckpt["args"]
-        print(patch_adapter_args)
+        logger.info(patch_adapter_args)
         apply_patch_adapter_to_hunyuan_video(
             model,
             new_patch_size=tuple(patch_adapter_args["patch_adapter_size"]) if "patch_adapter_size" in patch_adapter_args else (1,2,2),
@@ -337,17 +337,18 @@ def load_models(args, device, logger, pretrained_model_path):
         logger.info(f"Loading Multiple Kernels from {args.multiple_kernels_path}...")
         multiple_kernels_ckpt = torch.load(args.multiple_kernels_path, map_location="cpu", weights_only=False)
         multiple_kernels_args = multiple_kernels_ckpt["args"]
-        print(multiple_kernels_args)
+        logger.info(multiple_kernels_args)
         apply_multikernel_to_hunyuan_video(
             model,
             patch_sizes=multiple_kernels_args["kernel_sizes"] if "kernel_sizes" in multiple_kernels_args else [[1, 2, 2]],
+            copy_old_weights=True
         )
         load_multikernel_state_dict(model, multiple_kernels_ckpt["multi_kernel"], strict=False)
     if args.use_double_branch and args.double_branch_path is not None:
         logger.info(f"Loading Double Branch from {args.double_branch_path}...")
         double_branch_ckpt = torch.load(args.double_branch_path, map_location="cpu", weights_only=False)
         double_branch_args = double_branch_ckpt["args"]
-        print(double_branch_args)
+        logger.info(double_branch_args)
         apply_double_branch_to_hunyuan_video(
             model, 
             second_branch_config=get_transformer_branch_config_from_args(double_branch_args["second_branch_transformer_config"]),
@@ -361,8 +362,8 @@ def load_models(args, device, logger, pretrained_model_path):
             logger.info(f"Loading all model states from {pretrained_model_path}...")
             checkpoint = torch.load(pretrained_model_path, map_location="cpu", weights_only=False)
             load_output = model.load_state_dict(checkpoint["model"], strict=False)
-            print("Missing keys:", load_output.missing_keys)
-            print("Unexpected keys:", load_output.unexpected_keys)
+            logger.warning("Missing keys:", load_output.missing_keys)
+            logger.warning("Unexpected keys:", load_output.unexpected_keys)
 
     if hasattr(args, "train_from_scratch") and args.train_from_scratch:
         logger.info("Training from scratch, not loading any pre-trained weights.")

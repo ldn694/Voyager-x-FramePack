@@ -181,7 +181,7 @@ def get_lora_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
     This is small and can be saved as a separate checkpoint.
     """
     full_sd = model.state_dict()
-    lora_sd = {k: v for k, v in full_sd.items() if "lora_" in k}
+    lora_sd = {k: v.detach().clone() for k, v in full_sd.items() if "lora_" in k}
     return lora_sd
 
 

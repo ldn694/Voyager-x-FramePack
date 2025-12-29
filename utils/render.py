@@ -56,6 +56,13 @@ class Camera:
         points_2d_homogeneous = (K_tensor @ points_3d_camera[:, :3].T).T
         points_2d = points_2d_homogeneous[:, :2] / points_2d_homogeneous[:, 2:3]
         z = points_3d_camera[:, 2] # not actual depth, but depth in camera coordinates
+        if np.any(np.isnan(points_2d)) and np.any(np.isinf(points_2d)):
+            raise ValueError("NaN and Infs in projection!")
+        elif np.any(np.isnan(points_2d)):
+            raise ValueError("NaN in projection!")
+        elif np.any(np.isinf(points_2d)):
+            raise ValueError("Infs in projection!")
+        
         return points_2d, z
 
 class Frame:
@@ -101,7 +108,8 @@ class Frame:
         width, height = self.rgb.size
 
         # Get valid pixel coordinates
-        pixel_coords = np.round(projected_2d).astype(np.int32)
+        pixel_coords = np.round(projected_2d)
+        pixel_coords = np.clip(pixel_coords, np.iinfo(np.int32).min, np.iinfo(np.int32).max).astype(np.int32)
         cols = pixel_coords[:, 0]
         rows = pixel_coords[:, 1]
         valid_pixels = (

@@ -143,7 +143,7 @@ def get_double_branch_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
         "second_branch_blocks", 
         "cross_attn_blocks"
     ]
-    return {k: v for k, v in sd.items() if any(k.startswith(nk) for nk in new_keys)}
+    return {k: v.detach().clone() for k, v in sd.items() if any(k.startswith(nk) for nk in new_keys)}
 
 def load_double_branch_state_dict(model: nn.Module, state_dict: Dict[str, torch.Tensor], strict: bool = False):
     """Loads weights into the 2-branch components."""

@@ -1,5 +1,6 @@
 from typing import Any, List, Tuple, Optional, Union, Dict
 from einops import rearrange
+from loguru import logger
 
 import torch
 import torch.nn as nn
@@ -1079,17 +1080,17 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         return_dict: bool = True,
         indices: Optional[List[int]] = None,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
-        print(f"{x.shape=} {x.min()=} {x.max()=} {x.mean()=}")
-        print(f"latent {x[:, :16, :, :, :].shape=} {x[:, :16, :, :, :].min()=} {x[:, :16, :, :, :].max()=} {x[:, :16, :, :, :].mean()=}")
-        print(f"img_latent {x[:, 16:32, :, :, :].shape=} {x[:, 16:32, :, :, :].min()=} {x[:, 16:32, :, :, :].max()=} {x[:, 16:32, :, :, :].mean()=}")
-        print(f"mask_concat {x[:, 32:33, :, :, :].shape=} {x[:, 32:33, :, :, :].min()=} {x[:, 32:33, :, :, :].max()=} {x[:, 32:33, :, :, :].mean()=}")
-        print(f"partial_cond {x[:, 33:49, :, :, :].shape=} {x[:, 33:49, :, :, :].min()=} {x[:, 33:49, :, :, :].max()=} {x[:, 33:49, :, :, :].mean()=}")
-        print(f"partial_mask {x[:, 49:, :, :, :].shape=} {x[:, 49:, :, :, :].min()=} {x[:, 49:, :, :, :].max()=} {x[:, 49:, :, :, :].mean()=}")
-        print(f"{t.shape=} {t=}")
-        print(f"{text_states.shape=} {text_states.min()=} {text_states.max()} {text_states.mean()=}")
-        print(f"{text_states_2.shape=} {text_states_2.min()=} {text_states_2.max()=} {text_states_2.mean()=}")
-        print(f"{freqs_cos.shape=} {freqs_cos.min()=} {freqs_cos.max()=} {freqs_cos.mean()=}")
-        print(f"{freqs_sin.shape=} {freqs_sin.min()=} {freqs_sin.max()=} {freqs_sin.mean()=}")
+        logger.debug(f"{x.shape=} {x.min()=} {x.max()=} {x.mean()=}")
+        logger.debug(f"latent {x[:, :16, :, :, :].shape=} {x[:, :16, :, :, :].min()=} {x[:, :16, :, :, :].max()=} {x[:, :16, :, :, :].mean()=}")
+        logger.debug(f"img_latent {x[:, 16:32, :, :, :].shape=} {x[:, 16:32, :, :, :].min()=} {x[:, 16:32, :, :, :].max()=} {x[:, 16:32, :, :, :].mean()=}")
+        logger.debug(f"mask_concat {x[:, 32:33, :, :, :].shape=} {x[:, 32:33, :, :, :].min()=} {x[:, 32:33, :, :, :].max()=} {x[:, 32:33, :, :, :].mean()=}")
+        logger.debug(f"partial_cond {x[:, 33:49, :, :, :].shape=} {x[:, 33:49, :, :, :].min()=} {x[:, 33:49, :, :, :].max()=} {x[:, 33:49, :, :, :].mean()=}")
+        logger.debug(f"partial_mask {x[:, 49:, :, :, :].shape=} {x[:, 49:, :, :, :].min()=} {x[:, 49:, :, :, :].max()=} {x[:, 49:, :, :, :].mean()=}")
+        logger.debug(f"{t.shape=} {t=}")
+        logger.debug(f"{text_states.shape=} {text_states.min()=} {text_states.max()} {text_states.mean()=}")
+        logger.debug(f"{text_states_2.shape=} {text_states_2.min()=} {text_states_2.max()=} {text_states_2.mean()=}")
+        logger.debug(f"{freqs_cos.shape=} {freqs_cos.min()=} {freqs_cos.max()=} {freqs_cos.mean()=}")
+        logger.debug(f"{freqs_sin.shape=} {freqs_sin.min()=} {freqs_sin.max()=} {freqs_sin.mean()=}")
 
         out = {}
         img = x
@@ -1228,7 +1229,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                             token_replace_vec,
                             frist_frame_token_num,
                         ]
-                        print(f"First branch double block {layer_num} processing")
+                        logger.debug(f"First branch double block {layer_num} processing")
                         if self.training and self.gradient_checkpoint and \
                                 (self.gradient_checkpoint_layers == -1 or layer_num < self.gradient_checkpoint_layers):
                             # print(f'gradient checkpointing...')
@@ -1253,7 +1254,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                             token_replace_vec,
                             frist_frame_token_num,
                         ]
-                        print(f"First branch single block {layer_num - len(self.double_blocks)} processing")
+                        logger.debug(f"First branch single block {layer_num - len(self.double_blocks)} processing")
                         if self.training and self.gradient_checkpoint and \
                                 (self.gradient_checkpoint_layers == -1 or layer_num < self.gradient_checkpoint_layers):
                             # print(f'gradient checkpointing...')
@@ -1281,7 +1282,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                         token_replace_vec,
                         frist_frame_token_num,
                     ]
-                    print(f"Second branch single block {layer_num} processing")
+                    logger.debug(f"Second branch single block {layer_num} processing")
                     if self.training and self.gradient_checkpoint and \
                             (self.gradient_checkpoint_layers == -1 or layer_num < self.gradient_checkpoint_layers):
                         # print(f'gradient checkpointing...')
@@ -1296,7 +1297,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                 if not last_layer:
                     if u > 0:
                         # cross-attention between key after block u (query) and non-key after block v (key/value)
-                        print(f"Cross attention block {cross_attn_id} processing: keyframe {u} as query, non-keyframe {v} as key/value")
+                        logger.debug(f"Cross attention block {cross_attn_id} processing: keyframe {u} as query, non-keyframe {v} as key/value")
                         last_img = self.cross_attn_blocks[cross_attn_id](
                             last_img,
                             last_img_second_branch,
@@ -1314,7 +1315,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                         )
                     else:
                         # cross-attention between non-key after block u (query) and key after block v (key/value)
-                        print(f"Cross attention block {cross_attn_id} processing: non-keyframe {u} as query, keyframe {v} as key/value")
+                        logger.debug(f"Cross attention block {cross_attn_id} processing: non-keyframe {u} as query, keyframe {v} as key/value")
                         last_img_second_branch = self.cross_attn_blocks[cross_attn_id](
                             last_img_second_branch,
                             last_img,

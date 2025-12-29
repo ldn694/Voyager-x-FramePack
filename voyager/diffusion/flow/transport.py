@@ -241,6 +241,8 @@ class Transport:
             else:
                 terms['loss'] = mean_flat(
                     weight * ((model_output * sigma_t + x0) ** 2))
+        
+        terms['input_t'] = input_t.cpu().tolist()
 
         return model_output, terms
 

@@ -154,7 +154,7 @@ def get_multikernel_parameters(model: nn.Module):
     """
     Return a list of trainable parameters introduced by multi-kernel upgrade:
       - img_in.projs.*
-      - final_layer.linears.*
+      - final_layer.*
     """
     params = []
     for name, module in model.named_modules():
@@ -164,6 +164,7 @@ def get_multikernel_parameters(model: nn.Module):
         elif name == "final_layer" and isinstance(module, MultiFinalLayer):
             for linear in module.linears:
                 params.extend(linear.parameters())
+            params.extend(module.adaLN_modulation.parameters())
     return params
 
 
@@ -171,16 +172,16 @@ def get_multikernel_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
     """
     Return a state_dict containing only multi-kernel parameters:
       - img_in.projs.*
-      - final_layer.linears.*
+      - final_layer.*
     """
     sd = model.state_dict()
     mk_sd = {}
     for k, v in sd.items():
         if (
             k.startswith("img_in.projs.")
-            or k.startswith("final_layer.linears.")
+            or k.startswith("final_layer.")
         ):
-            mk_sd[k] = v
+            mk_sd[k] = v.detach().clone()
     return mk_sd
 
 
@@ -197,5 +198,5 @@ def load_multikernel_state_dict(
         multikernel_state_dict, strict=strict
     )
     # Optional debug:
-    # print("Missing keys:", missing)
-    # print("Unexpected keys:", unexpected)
+    # logger.warning("Missing keys:", missing)
+    # logger.warning("Unexpected keys:", unexpected)

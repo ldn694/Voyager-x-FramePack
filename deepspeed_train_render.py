@@ -1,4 +1,3 @@
-from loguru import logger
 from pathlib import Path
 from tqdm import tqdm
 import numpy as np
@@ -9,12 +8,14 @@ import json
 from datetime import datetime
 import matplotlib.pyplot as plt
 import time
+from loguru import logger
 
 import torch
 from torch.utils.data import DataLoader
 from torchvision.transforms import ToPILImage 
 import deepspeed
-from deepspeed.ops.adam import DeepSpeedCPUAdam
+from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
+from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 
 from dataset.RealEstate10K_render import RealEstate10K_render as RealEstate10K
@@ -22,7 +23,7 @@ from voyager.text_encoder import TextEncoder
 from voyager.config import *
 from voyager.diffusion import load_denoiser
 from voyager.diffusion.flow import Transport
-from voyager.utils.train_utils import set_reproducibility, prepare_model_inputs, get_training_output_dir
+from voyager.utils.train_utils import set_reproducibility, prepare_model_inputs, get_training_output_dir, get_synchronized_training_output_dir
 from voyager.utils.file_utils import save_videos_grid
 from voyager.inference import load_models
 from voyager.modules.lora_layers import apply_lora_to_hunyuan_video, get_lora_parameters, get_lora_state_dict, load_lora_state_dict
@@ -36,17 +37,46 @@ from voyager.cache.model_input_cache import ModelInputCache
 from gather_realestate import norm_partial_render_output
 from utils.render import Camera, Frame
 from utils.tensor import is_tensor_valid, check_nan_inf
+from utils.misc import setup_logger, print_rank0, get_rank
 from voyager.utils.helpers import as_list_of_3tuple
 
-def build_optimizer(param, args):
-    optimizer = DeepSpeedCPUAdam(
-        param,
-        lr=args.lr,
-        betas=(args.adam_beta1, args.adam_beta2),
-        eps=args.adam_eps,
-        weight_decay=args.weight_decay,
+def build_optimizer(params, args, ds_config: dict):
+    # Detect optimizer offload from ds_config
+    offload = (
+        ds_config.get("zero_optimization", {})
+                 .get("offload_optimizer", {})
+                 .get("device", "none")
     )
-    return optimizer
+    offload_to_cpu = (str(offload).lower() == "cpu")
+
+    if offload_to_cpu:
+        # Optimizer states + step happen on CPU
+        return DeepSpeedCPUAdam(
+            params,
+            lr=args.lr,
+            betas=(args.adam_beta1, args.adam_beta2),
+            eps=args.adam_eps,
+            weight_decay=args.weight_decay,
+        )
+
+    # No offload: use a GPU optimizer
+    # Prefer FusedAdam if available; fall back to AdamW
+    try:
+        return FusedAdam(
+            params,
+            lr=args.lr,
+            betas=(args.adam_beta1, args.adam_beta2),
+            eps=args.adam_eps,
+            weight_decay=args.weight_decay,
+        )
+    except Exception:
+        return torch.optim.AdamW(
+            params,
+            lr=args.lr,
+            betas=(args.adam_beta1, args.adam_beta2),
+            eps=args.adam_eps,
+            weight_decay=args.weight_decay,
+        )
 
 def parse_arg():
     import argparse
@@ -160,7 +190,8 @@ def training_step(
     args,
     model_kwargs: Optional[dict] = None,
     partial_cond=None,
-    partial_mask=None
+    partial_mask=None,
+    return_all_terms: bool = False,
 ) -> float:
     x1 = x1.to(model_engine.device)
 
@@ -171,24 +202,23 @@ def training_step(
     logger.info("Starting training step...")
     start_training_time = time.time()
 
-    with torch.no_grad():
-        with torch.autocast(
-            device_type="cuda",
-            dtype=model_engine.module.dtype,
-            enabled=autocast_enabled,
-        ):
-            model_output, terms = denoiser.training_losses(
-                model=model_engine.module,
-                x1=x1,
-                model_kwargs=model_kwargs,
-                timestep=None,
-                n_tokens=None,
-                i2v_mode=args.i2v_mode,
-                cond_latents=cond_latents,
-                args=args,
-                partial_cond=partial_cond,
-                partial_mask=partial_mask,
-            )
+    with torch.autocast(
+        device_type="cuda",
+        dtype=model_engine.module.dtype,
+        enabled=autocast_enabled,
+    ):
+        model_output, terms = denoiser.training_losses(
+            model=model_engine.module,
+            x1=x1,
+            model_kwargs=model_kwargs,
+            timestep=None,
+            n_tokens=None,
+            i2v_mode=args.i2v_mode,
+            cond_latents=cond_latents,
+            args=args,
+            partial_cond=partial_cond,
+            partial_mask=partial_mask,
+        )
     
 
     loss = terms["loss"].mean()
@@ -197,8 +227,8 @@ def training_step(
     backward_start_time = time.time()
 
     # DeepSpeed handles backward + optimizer
-    # model_engine.backward(loss)
-    # model_engine.step()
+    model_engine.backward(loss)
+    model_engine.step()
 
     logger.info(f"Completed backward pass and optimizer step in {time.time() - backward_start_time:.2f} seconds.")
 
@@ -210,7 +240,10 @@ def training_step(
     #                 if torch.isnan(param).any() or torch.isinf(param).any():
     #                     raise ValueError(f"Parameter {name} has NaN or Inf values!")
 
-    return loss.item()
+    if not return_all_terms:
+        return loss.item()
+    else:
+        return loss.item(), terms["input_t"]
 
 
 def load_rgbs_depths(rgbs, depths, placeholder_row_length):
@@ -325,7 +358,7 @@ def save_lora_checkpoint(model_engine, args, epoch, step, training_output_dir):
             }
 
             ckpt_path = Path(training_output_dir) / "lora_last.pt"
-            print(f"Saving LoRA checkpoint to {ckpt_path}")
+            logger.info(f"Saving LoRA checkpoint to {ckpt_path}")
             torch.save(ckpt, ckpt_path)
 
 def save_patch_adapter_checkpoint(model_engine, args, epoch, step, training_output_dir):
@@ -347,7 +380,7 @@ def save_patch_adapter_checkpoint(model_engine, args, epoch, step, training_outp
                 "args": vars(args),
             }
             ckpt_path = Path(training_output_dir) / "patch_adapter_last.pt"
-            print(f"Saving PatchAdapter checkpoint to {ckpt_path}")
+            logger.info(f"Saving PatchAdapter checkpoint to {ckpt_path}")
             torch.save(ckpt, ckpt_path)
 
 def save_multi_kernel_checkpoint(model_engine, args, epoch, step, training_output_dir):
@@ -370,7 +403,7 @@ def save_multi_kernel_checkpoint(model_engine, args, epoch, step, training_outpu
                 "args": vars(args),
             }
             ckpt_path = Path(training_output_dir) / "multi_kernel_last.pt"
-            print(f"Saving Multi-Kernel checkpoint to {ckpt_path}")
+            logger.info(f"Saving Multi-Kernel checkpoint to {ckpt_path}")
             torch.save(ckpt, ckpt_path)
 
 def save_double_branch_checkpoint(model_engine, args, epoch, step, training_output_dir):
@@ -393,11 +426,10 @@ def save_double_branch_checkpoint(model_engine, args, epoch, step, training_outp
                 "args": vars(args),
             }
             ckpt_path = Path(training_output_dir) / "double_branch_last.pt"
-            print(f"Saving Double Branch checkpoint to {ckpt_path}")
+            logger.info(f"Saving Double Branch checkpoint to {ckpt_path}")
             torch.save(ckpt, ckpt_path)
 
 def save_ckpt(args, model_engine, epoch, step, training_output_dir, total_skip):
-    print(torch.cuda.memory_summary())
     logger.warning(f"Skipped {total_skip} batches due to NaN/Inf so far.")
     if args.train_from_scratch:
         ckpt_path = Path(training_output_dir) / f"model_{args.model}_last.pt"
@@ -421,8 +453,14 @@ def save_ckpt(args, model_engine, epoch, step, training_output_dir, total_skip):
         save_double_branch_checkpoint(model_engine, args, epoch, step, training_output_dir)
 
 if __name__ == "__main__":
+    deepspeed.init_distributed()
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank)
+    setup_logger(enabled=True)
     args = parse_arg()
-    print(args)
+    args.device = f"cuda:{local_rank}"
+    logger.info(args)
+    global_rank = dist.get_rank()
 
     #===================INITIALIZATION===================#
 
@@ -430,33 +468,47 @@ if __name__ == "__main__":
     dtype = PRECISION_TO_TYPE[args.precision]
     set_reproducibility(True, args.global_seed)
     os.makedirs(args.output_dir, exist_ok=True)
-    training_output_dir = get_training_output_dir(args.output_dir)
+    training_output_dir = get_synchronized_training_output_dir(args.output_dir)
     os.makedirs(training_output_dir, exist_ok=True)
     deepspeed_config = args.deepspeed_config if hasattr(args, "deepspeed_config") else "ds_config.json"
     with open(deepspeed_config, 'r') as f:
         ds_config = json.load(f)
 
-    from copy import copy
-    if args.use_double_branch:
+
+    if global_rank == 0:
+        from copy import copy
         tmp_args = copy(args)
-        tmp_args.second_branch_transformer_config = tmp_args.second_branch_transformer_config.to_dict()
-    else:
-        tmp_args = copy(args)
-    config = {
-        'time': datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
-        'output_dir': training_output_dir.__str__(),
-        'model_args': vars(tmp_args),
-        'deepspeed_config': ds_config,
-    }
-    with open(Path(training_output_dir) / 'training_config.json', 'w') as f:
-        json.dump(config, f, indent=4)
+        if args.use_double_branch:
+             tmp_args.second_branch_transformer_config = tmp_args.second_branch_transformer_config.to_dict()
+        
+        config = {
+            'time': datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
+            'output_dir': str(training_output_dir),
+            'model_args': vars(tmp_args),
+            'deepspeed_config': ds_config,
+        }
+        with open(Path(training_output_dir) / 'training_config.json', 'w') as f:
+            json.dump(config, f, indent=4)
     logger.info(f"Training output dir: {training_output_dir}")
 
     #===================DATASET & DATALOADER===================#
 
     dataset_root = args.dataset_root
     dataset = RealEstate10K(dataset_root, set_name=args.task_flag, width=args.width, height=args.height, return_inverse_depth=True)
-    dataloader = DataLoader(dataset, batch_size=ds_config["train_micro_batch_size_per_gpu"], shuffle=True, num_workers=args.num_workers)
+    sampler = DistributedSampler(
+        dataset,
+        num_replicas=dist.get_world_size(),
+        rank=dist.get_rank(),
+        shuffle=True
+    )
+    dataloader = DataLoader(
+        dataset,
+        batch_size=ds_config["train_micro_batch_size_per_gpu"],
+        sampler=sampler,      # <--- Added
+        shuffle=False,        # <--- Must be False when using sampler
+        num_workers=args.num_workers,
+        pin_memory=True       # Recommended for GPU training
+    )
 
     #===================MODEL, OPTIMIZER & DEEPSPEED INIT===================#
 
@@ -551,7 +603,11 @@ if __name__ == "__main__":
     trainable_params_cnt = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Total parameters: {total_params_cnt}")
     logger.info(f"Trainable parameters: {trainable_params_cnt}")
-    optimizer = build_optimizer(trainable_params, args)
+    optimizer = build_optimizer(trainable_params, args, ds_config)
+
+    runtime_seed = args.global_seed + global_rank
+    set_reproducibility(True, runtime_seed)
+    logger.warning(f"Rank {global_rank} re-seeded with {runtime_seed} for training loop.")
 
     #===================RESUME FROM CHECKPOINT IF ANY===================#
 
@@ -623,7 +679,7 @@ if __name__ == "__main__":
         args=args,
         model=model,
         optimizer=optimizer,
-        model_parameters=lora_params,  # the same params you passed to optimizer
+        model_parameters=trainable_params,  # the same params you passed to optimizer
         config=ds_config
     )
     steps_per_update = model_engine.gradient_accumulation_steps()
@@ -635,12 +691,21 @@ if __name__ == "__main__":
     start_time = time.time()
     running_loss = 0.0
     total_skip = 0
+    should_stop_training = False
+
     for epoch in range(start_epoch, args.epochs):
-        pbar = tqdm(enumerate(dataloader), desc=f"Epoch {epoch + 1}")
+        dataloader.sampler.set_epoch(epoch)
+        if get_rank() == 0:
+            pbar = tqdm(enumerate(dataloader), desc=f"Epoch {epoch + 1}")
+        else:
+            pbar = enumerate(dataloader)
+        if should_stop_training:
+            break
         for step, data in pbar:
             # update desc, print hour, minute, second
             elasped_time = time.time() - start_time
-            pbar.set_description_str(f"Epoch {epoch + 1} | Time {int(elasped_time // 3600):02d}:{int((elasped_time % 3600) // 60):02d}:{int(elasped_time % 60):02d}")
+            if get_rank() == 0:
+                pbar.set_description_str(f"Epoch {epoch + 1} | Time {int(elasped_time // 3600):02d}:{int((elasped_time % 3600) // 60):02d}:{int(elasped_time % 60):02d}")
             if epoch == start_epoch and step <= start_step_in_epoch:
                 # We already processed these batches before checkpoint; skip them.
                 continue
@@ -650,8 +715,8 @@ if __name__ == "__main__":
             w2cs = data['w2c']  # (B, T, 4, 4)
             sample_id = data['sample_id'] # [str] of length B
             prompt = data['prompt']  # [str] of length B
-            print(prompt)
-            print(sample_id)
+            logger.info(prompt)
+            logger.info(sample_id)
 
             check_nan_inf({
                 "rgbs": rgbs,
@@ -700,9 +765,9 @@ if __name__ == "__main__":
                                                                     model_engine.module, vae, text_encoder, text_encoder_2,\
                                                                     args.rope_theta_rescale_factor, args.rope_interpolation_factor,
                                                                     skip_cond_latent=True)
-                    cond_latents = cond_latents.to(model_engine.module.dtype).to(model_engine.module.device)
-                    partial_cond = partial_cond.to(model_engine.module.dtype).to(model_engine.module.device)
-                    partial_mask = partial_mask.to(model_engine.module.dtype).to(model_engine.module.device)
+                    cond_latents = cond_latents.to(model_engine.module.dtype).to(args.device)
+                    partial_cond = partial_cond.to(model_engine.module.dtype).to(args.device)
+                    partial_mask = partial_mask.to(model_engine.module.dtype).to(args.device)
                     logger.info(f"Loaded cached model inputs with latents shape {latents.shape}, cond_latents shape {cond_latents.shape}")
                     need_compute_from_scratch = False
             if need_compute_from_scratch:
@@ -786,7 +851,7 @@ if __name__ == "__main__":
             # save_videos_grid(image, "/raid/hvtham/ldnhuan/HunyuanWorld-Voyager/debug.mp4", fps=24)
             # # END DEBUG
 
-            loss = training_step(
+            loss, input_t = training_step(
                 latents,
                 cond_latents,
                 model_engine,
@@ -795,19 +860,24 @@ if __name__ == "__main__":
                 model_kwargs=model_kwargs,
                 partial_cond=partial_cond,
                 partial_mask=partial_mask,
+                return_all_terms=True,
             )
+
+            global_step = epoch * len(dataloader) + step
+            effective_update = (global_step + 1) // steps_per_update
+            is_update_step = (global_step + 1) % steps_per_update == 0
 
             # When one effective update is done
             if model_engine.global_rank == 0:
                 running_loss += loss
-                global_step = epoch * len(dataloader) + step
                 loss_values.append({
                     'step': global_step,
                     'loss': loss,
                     'sample_id': sample_id,
+                    'input_t': input_t
                 })
                 
-                if (global_step + 1) % steps_per_update == 0:
+                if is_update_step:
                     avg_loss = running_loss / steps_per_update
                     avg_loss_values.append({
                         'step': global_step + 1,
@@ -825,20 +895,37 @@ if __name__ == "__main__":
                     plt.title('Average Training Loss')
                     plt.savefig(Path(training_output_dir) / 'avg_loss_curve.png')
                     plt.close()
+            
+            if is_update_step and args.save_every > 0 and (effective_update % args.save_every == 0):
+                save_ckpt(args, model_engine, epoch, step, training_output_dir, total_skip)
 
-                    effective_update = (global_step + 1) // steps_per_update
+            if args.early_stop_training_loss is not None:
+                # 1. Create a tensor for the current local loss
+                # We clone it to avoid modifying the computation graph
+                loss_tensor = torch.tensor(loss, device=args.device)
 
-                    if args.save_every > 0 and (effective_update % args.save_every == 0):
-                        save_ckpt(args, model_engine, epoch, step, training_output_dir, total_skip)
+                # 2. Sync: Average the loss across ALL GPUs
+                # This ensures every rank sees the exact same "avg_loss" value
+                dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+                global_avg_loss = loss_tensor.item()
 
-                    ####DEBUG ONLY, EARLY STOP WHEN LOSS < 0.03
-                    if args.early_stop_training_loss is not None and loss < args.early_stop_training_loss:
-                        save_ckpt(args, model_engine, epoch, step, training_output_dir, total_skip)
-                        logger.info(f"Early stopping at epoch {epoch}, step {step} due to low loss {loss}, smaller than {args.early_stop_training_loss}")
-                        exit(0)
-                    ####END DEBUG ONLY
-                print(f"{latents.shape=}")
-                print(f"{cond_latents.shape=}")
-                print(f"{n_tokens=}")
+                # 3. Decision: Check threshold
+                if global_avg_loss < args.early_stop_training_loss:
+                    # Only log on Rank 0 to avoid spam
+                    if dist.get_rank() == 0:
+                        logger.info(f"Early stopping triggered! Global Loss {global_avg_loss:.4f} < {args.early_stop_training_loss}")
+                        
+                    # Optional: Save a final checkpoint before quitting
+                    save_ckpt(args, model_engine, epoch, step, training_output_dir, total_skip)
+
+                    # 4. Set the flag to True on ALL ranks
+                    should_stop_training = True
+                    
+                    # 5. Break the INNER (Step) loop
+                    break
+
+            logger.info(f"{latents.shape=}")
+            logger.info(f"{cond_latents.shape=}")
+            logger.info(f"{n_tokens=}")
             
             

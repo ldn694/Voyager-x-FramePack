@@ -3,6 +3,7 @@ import torchvision.transforms as transforms
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 import imageio
 import os
@@ -473,3 +474,41 @@ def get_training_output_dir(root_folder, name=None):
         next_index = max(existing_indices, default=0) + 1
         output_dir = Path(root_folder) / f"run_{next_index:05d}"
     return output_dir
+
+def get_synchronized_training_output_dir(root_folder, name=None):
+    """
+    Calculates output directory on Rank 0 and broadcasts it to all other ranks
+    to ensure consistency and prevent race conditions.
+    """
+    output_path = None
+    
+    # Only Rank 0 interacts with the filesystem to determine the next run ID
+    if dist.get_rank() == 0:
+        if name is not None:
+            output_path = Path(root_folder) / name
+        else:
+            if not os.path.exists(root_folder):
+                os.makedirs(root_folder, exist_ok=True)
+                
+            existing_dirs = [
+                d for d in os.listdir(root_folder)
+                if os.path.isdir(os.path.join(root_folder, d)) and d.startswith("run_")
+            ]
+            existing_indices = [
+                int(d.split("_")[1]) for d in existing_dirs if d.split("_")[1].isdigit()
+            ]
+            next_index = max(existing_indices, default=0) + 1
+            output_path = Path(root_folder) / f"run_{next_index:05d}"
+        
+        # Create the directory immediately on Rank 0
+        os.makedirs(output_path, exist_ok=True)
+
+    # Prepare a list for broadcasting (broadcast_object_list expects a list)
+    # If Rank 0, this contains the path. If Rank > 0, this is None (to be filled).
+    broadcast_data = [output_path]
+    
+    # Broadcast the path from Rank 0 to all other ranks
+    dist.broadcast_object_list(broadcast_data, src=0)
+    
+    # Return the synchronized path
+    return broadcast_data[0]

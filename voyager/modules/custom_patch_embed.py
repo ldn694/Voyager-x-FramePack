@@ -117,7 +117,7 @@ def apply_patch_adapter_to_hunyuan_video(
         new_patch_size = (1, new_patch_size[0], new_patch_size[1])
     else:
         new_patch_size = tuple(new_patch_size)
-    print(f"Applying Patch Adapter with new_patch_size={new_patch_size}...")
+    logger.info(f"Applying Patch Adapter with new_patch_size={new_patch_size}...")
 
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
@@ -163,7 +163,7 @@ def apply_patch_adapter_to_hunyuan_video(
                 old_img_in.proj,
             )
         except Exception as e:
-            print(f"Warning: could not init img_in Conv3d from pretrained weights: {e}")
+            logger.warning(f"Could not init img_in Conv3d from pretrained weights: {e}")
 
     model.img_in = new_img_in
 
@@ -187,8 +187,8 @@ def apply_patch_adapter_to_hunyuan_video(
                     old_condition_in.proj,
                 )
             except Exception as e:
-                print(
-                    f"Warning: could not init condition_in Conv3d from pretrained weights: {e}"
+                logger.warning(
+                    f"Could not init condition_in Conv3d from pretrained weights: {e}"
                 )
 
         model.condition_in = new_condition_in
@@ -214,8 +214,8 @@ def apply_patch_adapter_to_hunyuan_video(
                 old_final_layer.adaLN_modulation.state_dict()
             )
         except RuntimeError as e:
-            print(
-                f"Warning: could not load adaLN_modulation weights from old FinalLayer: {e}"
+            logger.warning(
+                f"Could not load adaLN_modulation weights from old FinalLayer: {e}"
             )
 
     # # Freeze AdaLN params so they are NOT updated during adapter training
@@ -285,7 +285,7 @@ def get_patch_adapter_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
         # elif k.startswith("final_layer."):
         #     patch_sd[k] = v
         if k.startswith("final_layer.linear."):
-            patch_sd[k] = v
+            patch_sd[k] = v.detach().clone()
 
     return patch_sd
 
