@@ -1070,6 +1070,9 @@ class HunyuanVideoSampler(Inference):
             freqs_cos, freqs_sin = self.get_rotary_pos_embed(
             target_video_length, target_height, target_width
         )   
+        freqs_cos_full, freqs_sin_full = self.get_rotary_pos_embed(
+            target_video_length, target_height, target_width
+        )   
         
         # Generate rotary position embeddings for conditional frames
         # Adjusted dimensions account for the conditional frame structure
@@ -1131,7 +1134,9 @@ class HunyuanVideoSampler(Inference):
             partial_cond=partial_cond,
             partial_mask=partial_mask,
             use_kernel_indices=use_kernel_indices,
+            freqs_cis_full=(freqs_cos_full, freqs_sin_full),
             logger=logger,
+            mode_scheduler_name=self.args.mode_scheduler_name
         )[0]
         out_dict["samples"] = samples
         out_dict["prompts"] = prompt

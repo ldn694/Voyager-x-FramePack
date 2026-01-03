@@ -1,4 +1,5 @@
 from .models import HYVideoDiffusionTransformer, HUNYUAN_VIDEO_CONFIG
+from .sampler_scheduler import SamplerScheduler
 
 
 def load_model(args, in_channels, out_channels, factor_kwargs):

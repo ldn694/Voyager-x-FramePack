@@ -12,6 +12,7 @@ from PIL import Image
 from torchvision.transforms import ToPILImage 
 import trimesh
 import torch
+from loguru import logger
 
 def parse_arg():
     import argparse
@@ -21,6 +22,7 @@ def parse_arg():
     parser.add_argument('--split', type=str, default='refined_test_150', help='Dataset split to use')
     parser.add_argument('--width', type=int, default=360, help='Width of images to load')
     parser.add_argument('--height', type=int, default=384, help='Height of images to load')
+    parser.add_argument('--use-ground-truth', action='store_true', help='Whether to use ground truth rgb and depth or partial')
     args = parser.parse_args()
     return args
 
@@ -55,11 +57,17 @@ def parse_arg():
 
 def norm_partial_render_output(render, mask, depth):
     mask_indices = mask > 0
+    if mask_indices.sum() == 0:
+        logger.warning("Empty mask, returning zero inverse depth.")
+        return render, mask, np.zeros_like(depth)
     depth[mask_indices] = 1 / (depth[mask_indices] + 1e-6)
     depth_values = depth[mask_indices]
     min_percentile = np.percentile(depth_values, 2)
     max_percentile = np.percentile(depth_values, 98)
-    print(f"Depth percentiles: min {min_percentile}, max {max_percentile}")
+    # print(f"Depth percentiles: min {min_percentile}, max {max_percentile}")
+    if max_percentile - min_percentile < 1e-6:
+        logger.warning("Depth percentiles too close, returning one inverse depth.")
+        return render, mask, np.ones_like(depth)
     depth[mask_indices] = (depth[mask_indices] - min_percentile) / (max_percentile - min_percentile)
     depth[~mask_indices] = depth[mask_indices].min()
     return render, mask, depth
@@ -118,6 +126,7 @@ if __name__ == "__main__":
         )
 
         total_rendered_image_tensor = []
+        total_depth_tensor = []
 
         for i in range(T):
             rgb = ToPILImage()(rgbs[:, i])
@@ -128,7 +137,10 @@ if __name__ == "__main__":
                 camera=Camera(intrinsics[i].numpy(), w2cs[i].numpy()),
                 is_reverse_depth=True,
             )
-            rendered_image, mask, depth_buffer = first_frame.render(frame.camera)
+            if (args.use_ground_truth):
+                rendered_image, mask, depth_buffer = frame.render(frame.camera)
+            else:
+                rendered_image, mask, depth_buffer = first_frame.render(frame.camera)
             rendered_image, mask, depth_buffer = norm_partial_render_output(
                 rendered_image, mask, depth_buffer
             )
@@ -147,7 +159,14 @@ if __name__ == "__main__":
                 cv2.imwrite(mask_path, mask)
             # print(f"Min rgb: {rendered_image.min()}, Max rgb: {rendered_image.max()}")
             total_rendered_image_tensor.append((torch.from_numpy(rendered_image).float().permute(2,0,1) / 255.0).contiguous())  # (3, H, W)
-        total_rendered_image_tensor = torch.stack(total_rendered_image_tensor, dim=1)  # (3, T, H, W)
+            total_depth_tensor.append(torch.from_numpy(depth_buffer.clip(0, 1)).float().unsqueeze(0).repeat(3, 1, 1))  # (3, H, W)
+        total_rendered_image_tensor = torch.stack(total_rendered_image_tensor, dim=1)  # (3, H, W)
+        total_depth_tensor = torch.stack(total_depth_tensor, dim=1)  # (3, T, H, W)
+        
         input_video_path = os.path.join(input_folder, 'video.mp4')
         print(f'Saving input video to {input_video_path}')
         tensor_to_mp4(total_rendered_image_tensor, input_video_path, fps=10)
+
+        depth_video_path = os.path.join(input_folder, 'depth_video.mp4')
+        print(f'Saving depth video to {depth_video_path}')
+        tensor_to_mp4(total_depth_tensor, depth_video_path, fps=10)

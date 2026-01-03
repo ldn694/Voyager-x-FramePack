@@ -9,6 +9,8 @@ from voyager.config import parse_args
 from voyager.inference import HunyuanVideoSampler
 from pathlib import Path
 from utils.metrics import MergedMetric
+from loguru import logger
+import sys
 
 def read_ground_truth_rgb(folder, num_frames):
     print(f"Reading ground truth from {folder} for {num_frames} frames")
@@ -28,14 +30,26 @@ def read_ground_truth_rgb(folder, num_frames):
     return rgbs
 
 if __name__ == "__main__":
-    args = parse_args()
+    args = parse_args(mode="eval_realestate10K")
+    logger.remove()
+    logger.add(sys.stderr, level="INFO")
     models_root_path = Path(args.model_base)
+    if args.use_multiple_kernels and (args.multiple_kernels_path is not None):
+        multiple_kernels_ckpt = torch.load(args.multiple_kernels_path, map_location="cpu", weights_only=False)
+        multiple_kernels_args = multiple_kernels_ckpt["args"]
+        args.use_kernel_sizes = multiple_kernels_args["kernel_sizes"]
     hunyuan_video_sampler = HunyuanVideoSampler.from_pretrained(
         models_root_path, args=args)
     
-    dataset_path = '/raid/hvtham/ldnhuan/HunyuanWorld-Voyager/dataset/RealEstate10K/refined_test_150_768x512'
-    output_path = 'evaluation/RealEstate10K/refined_test_150_768x512'
+    dataset_path = args.dataset_path
+    output_path = args.output_path
     os.makedirs(output_path, exist_ok=True)
+    args_path = os.path.join(output_path, 'args.json')
+    args_json = vars(args)
+    args_json['dataset_path'] = dataset_path
+    args_json['output_path'] = output_path
+    with open(args_path, 'w') as f:
+        json.dump(args_json, f, indent=4)
 
     merged_metric = MergedMetric(device='cuda')
 
@@ -43,14 +57,21 @@ if __name__ == "__main__":
     start_time = time.time()
     total_tests = len(test_paths)
     for idx, test_path in enumerate(test_paths, 1):
+        single_start_time = time.time()
         elapsed = time.time() - start_time
         avg_time = elapsed / idx
         eta = avg_time * (total_tests - idx)
         print(f"[{idx}/{total_tests}] ETA: {eta/60:.2f} min")
+        # if (test_path != 'a688088d3921c03f'):
+        #     continue
         full_input_path = os.path.join(dataset_path, test_path, 'input')
         save_path = os.path.join(output_path, test_path)
         os.makedirs(save_path, exist_ok=True)
         print(f'Processing {full_input_path}, saving to {save_path}')
+
+        if os.path.exists(os.path.join(save_path, f'{test_path}.json')):
+            print(f"Metrics already exist for {test_path}, skipping...")
+            continue
 
         outputs = hunyuan_video_sampler.predict(
             prompt=args.prompt,
@@ -81,9 +102,10 @@ if __name__ == "__main__":
                 os.path.join(full_input_path, "depth", f"{j:03d}.exr")
             ) for j in range(49)],
             partial_mask=[(
-                os.path.join(full_input_path, "rgb", f"{j:03d}.png"),
+                os.path.join(full_input_path, "mask", f"{j:03d}.png"),
                 os.path.join(full_input_path, "mask", f"{j:03d}.png")
             ) for j in range(49)],
+            use_kernel_indices = args.use_kernel_indices if args.use_kernel_indices is not None else None,
         )
         samples = outputs['samples'] # (B, C, T, H * 2, W)
         save_videos_grid(samples, os.path.join(save_path, f'{test_path}.mp4'), fps=10)
@@ -93,6 +115,9 @@ if __name__ == "__main__":
         full_ground_truth_path = os.path.join(dataset_path, test_path, 'ground_truth')
         ground_truth = read_ground_truth_rgb(full_ground_truth_path, samples.shape[0])  # (T, C, H, W)
         assert samples.shape == ground_truth.shape, f"Shape mismatch: samples {samples.shape}, ground_truth {ground_truth.shape}"
+        if args.first_clean_frame: # Whether to use the first clean frame for evaluation
+            samples[0] = ground_truth[0]
+        single_test_time = time.time() - single_start_time
         metrics = merged_metric.compute(samples, ground_truth)  # (T,)
         avg_metric = {}
         for metric in metrics:
@@ -101,6 +126,7 @@ if __name__ == "__main__":
         final_metric = {
             'metrics': metrics,
             'avg_metric': avg_metric,
+            'time': single_test_time
         }
         # Save metrics to json
         with open(os.path.join(save_path, f'{test_path}.json'), 'w') as f:

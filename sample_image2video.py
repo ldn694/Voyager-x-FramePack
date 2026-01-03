@@ -3,6 +3,9 @@ import time
 from pathlib import Path
 from loguru import logger
 from datetime import datetime
+import torch
+import json
+import sys
 
 from voyager.utils.file_utils import save_videos_grid
 from voyager.config import parse_args
@@ -10,7 +13,13 @@ from voyager.inference import HunyuanVideoSampler
 
 
 def main():
+    logger.remove()
+    logger.add(sys.stderr, level="INFO")
     args = parse_args()
+    if args.use_multiple_kernels and (args.multiple_kernels_path is not None):
+        multiple_kernels_ckpt = torch.load(args.multiple_kernels_path, map_location="cpu", weights_only=False)
+        multiple_kernels_args = multiple_kernels_ckpt["args"]
+        args.use_kernel_sizes = multiple_kernels_args["kernel_sizes"]
     print(args)
     models_root_path = Path(args.model_base)
     if not models_root_path.exists():
@@ -27,7 +36,6 @@ def main():
 
     # Get the updated args
     args = hunyuan_video_sampler.args
-
     # Start sampling
     # TODO: batch inference check
     outputs = hunyuan_video_sampler.predict(
@@ -50,12 +58,43 @@ def main():
         i2v_stability=args.i2v_stability,
         ulysses_degree=args.ulysses_degree,
         ring_degree=args.ring_degree,
-        ref_images=[(os.path.join(args.input_path, "ref_image.png"),
-                     os.path.join(args.input_path, "ref_depth.exr"))],
-        partial_cond=[(os.path.join(args.input_path, "video_input", f"render_{j:04d}.png"), os.path.join(
-            args.input_path, "video_input", f"depth_{j:04d}.exr")) for j in range(49)],
-        partial_mask=[(os.path.join(args.input_path, "video_input", f"mask_{j:04d}.png"), os.path.join(
-            args.input_path, "video_input", f"mask_{j:04d}.png")) for j in range(49)]
+        # ref_images=[(
+        #     os.path.join(args.input_path, "ref_image.png"),
+        #     os.path.join(args.input_path, "ref_depth.exr")
+        # )],
+        ref_images=[(
+            os.path.join(args.input_path, "rgb", "000.png"),
+            os.path.join(args.input_path, "depth", "000.exr")
+        )],
+        # ref_images=[(
+        #     os.path.join(args.input_path, "final", "rendered_views", "render_0000.png"),
+        #     os.path.join(args.input_path, "final", "output_inverse_depth_dir", "gt_0000_inverse.exr")
+        # )],
+        # partial_cond=[(
+        #     os.path.join(args.input_path, "video_input", f"render_{j:04d}.png"),
+        #     os.path.join(args.input_path, "video_input", f"depth_{j:04d}.exr")
+        # ) for j in range(49)],
+        partial_cond=[(
+            os.path.join(args.input_path, "rgb", f"{j:03d}.png"),
+            os.path.join(args.input_path, "depth", f"{j:03d}.exr")
+        ) for j in range(args.video_length)],
+        # partial_cond=[(
+        #     os.path.join(args.input_path, "final", "rendered_views", f"render_{j:04d}.png"),
+        #     os.path.join(args.input_path, "final", "output_inverse_depth_dir", f"gt_{j:04d}_inverse.exr")
+        # ) for j in range(49)],
+        # partial_mask=[(
+        #     os.path.join(args.input_path, "video_input", f"mask_{j:04d}.png"),
+        #     os.path.join(args.input_path, "video_input", f"mask_{j:04d}.png")
+        # ) for j in range(49)],
+        partial_mask=[(
+            os.path.join(args.input_path, "mask", f"{j:03d}.png"),
+            os.path.join(args.input_path, "mask", f"{j:03d}.png")
+        ) for j in range(args.video_length)],
+        # partial_mask=[(
+        #     os.path.join(args.input_path, "final", "rendered_views", f"mask_{j:04d}.png"),
+        #     os.path.join(args.input_path, "final", "rendered_views", f"mask_{j:04d}.png")
+        # ) for j in range(49)],
+        use_kernel_indices = args.use_kernel_indices if args.use_kernel_indices is not None else None,
     )
     samples = outputs['samples']
 
@@ -66,10 +105,20 @@ def main():
             sample = samples[i].unsqueeze(0)
             time_flag = datetime.fromtimestamp(
                 time.time()).strftime("%Y-%m-%d-%H:%M:%S")
-            cur_save_path = \
-                f"{save_path}/{time_flag}_seed{outputs['seeds'][i]}_{outputs['prompts'][i][:100].replace('/', '')}.mp4"
+            # cur_save_path = \
+            #     f"{save_path}/{time_flag}_seed{outputs['seeds'][i]}_{outputs['prompts'][i][:100].replace('/', '')}.mp4"
+            # save_videos_grid(sample, cur_save_path, fps=24)
+            # logger.info(f'Sample save to: {cur_save_path}')
+            cur_save_folder = \
+                f"{save_path}/{time_flag}_seed{outputs['seeds'][i]}_{outputs['prompts'][i][:100].replace('/', '')}"
+            os.makedirs(cur_save_folder, exist_ok=True)
+            cur_save_path = f"{cur_save_folder}/sample.mp4"
             save_videos_grid(sample, cur_save_path, fps=24)
             logger.info(f'Sample save to: {cur_save_path}')
+            with open(f"{cur_save_folder}/args.json", "w") as f:
+                vars_args = vars(args)
+                json.dump(vars_args, f, indent=4)
+            logger.info(f'Args save to: {cur_save_folder}/args.json')
 
 
 if __name__ == "__main__":

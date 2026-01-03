@@ -46,7 +46,7 @@ from diffusers.utils import BaseOutput
 from ...constants import PRECISION_TO_TYPE
 from ...vae.autoencoder_kl_causal_3d import AutoencoderKLCausal3D
 from ...text_encoder import TextEncoder
-from ...modules import HYVideoDiffusionTransformer
+from ...modules import HYVideoDiffusionTransformer, SamplerScheduler
 from ...utils.data_utils import black_image
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -749,6 +749,8 @@ Please use VaeImageProcessor.postprocess(...) instead"
         semantic_images=None,
         partial_cond=None,
         partial_mask=None,
+        use_kernel_indices: Optional[List[int]] = None,
+        freqs_cis_full: Tuple[torch.Tensor, torch.Tensor] = None,
         **kwargs,
     ):
         r"""
@@ -834,6 +836,7 @@ Please use VaeImageProcessor.postprocess(...) instead"
                 second element is a list of `bool`s indicating whether the corresponding generated image contains
                 "not-safe-for-work" (nsfw) content.
         """
+        logger = kwargs.get("logger", None)
         callback = kwargs.pop("callback", None)
         callback_steps = kwargs.pop("callback_steps", None)
 
@@ -996,6 +999,8 @@ Please use VaeImageProcessor.postprocess(...) instead"
             i2v_condition_type=i2v_condition_type,
             i2v_stability=i2v_stability
         )
+        if logger is not None:
+            logger.info(f"{latents.shape=}, {img_latents.shape=}")
 
         if i2v_mode and i2v_condition_type == "latent_concat":
             if img_latents.shape[2] == 1:
@@ -1012,11 +1017,23 @@ Please use VaeImageProcessor.postprocess(...) instead"
                                      img_latents_concat.shape[2], img_latents_concat.shape[3],
                                      img_latents_concat.shape[4]).to(device=img_latents.device)
             mask_concat[:, :, 1:, ...] = 0
+        if logger is not None:
+            logger.info(f"{img_latents_concat.shape=}, {img_latents_concat.min()=}, {img_latents_concat.max()=}")
+            logger.info(f"{mask_concat.shape=}, {mask_concat.min()=}, {mask_concat.max()=}")
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_func_kwargs(
             self.scheduler.step,
-            {"generator": generator, "eta": eta},
+            {
+                "generator": generator, 
+                "eta": eta, 
+                "ref_sample": img_latents,
+                "ref_guidance_scale": 1.0,
+                # "consistent_guidance_scale": consistent_guidance_scale if consistent_guidance_scale > 0 else None, 
+                # "original_sample": partial_cond if consistent_guidance_scale > 0 else None,
+                # "original_latents": latents if consistent_guidance_scale > 0 else None
+                # "original_sample": img_latents if consistent_guidance_scale > 0 else None
+            },
         )
 
         target_dtype = PRECISION_TO_TYPE[self.args.precision]
@@ -1033,7 +1050,15 @@ Please use VaeImageProcessor.postprocess(...) instead"
             num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
 
-        # if is_progress_bar:
+        sampler_scheduler = SamplerScheduler(
+            num_steps=num_inference_steps,
+            modes=["custom", "default"]
+        )
+
+        mode_schedule_name = kwargs.get("mode_scheduler_name", None)
+        mode_schedule = sampler_scheduler.get_scheduler(mode_schedule_name, self.args)
+        logger.info(f"Using mode schedule: {mode_schedule}")
+
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -1047,6 +1072,9 @@ Please use VaeImageProcessor.postprocess(...) instead"
                 if i2v_mode and i2v_condition_type == "latent_concat":
                     latent_model_input = torch.concat(
                         [latents, img_latents_concat, mask_concat, partial_cond, partial_mask], dim=1)
+                        # [16, 16, 1, 16, 1]
+                    if logger is not None:
+                        logger.debug(f"latent_concat: {latent_model_input.shape=}, {latent_model_input.min()=}, {latent_model_input.max()=}")
                 else:
                     latent_model_input = latents
 
@@ -1056,10 +1084,15 @@ Please use VaeImageProcessor.postprocess(...) instead"
                     else latent_model_input
                 )
 
+                if logger is not None:
+                    logger.debug(f"{latent_model_input.shape=}, {latent_model_input.min()=}, {latent_model_input.max()=}")
+
                 latent_model_input = self.scheduler.scale_model_input(
                     latent_model_input, t
                 )
 
+                if logger is not None:
+                    logger.debug(f"{latent_model_input.shape=}, {latent_model_input.min()=}, {latent_model_input.max()=}")
                 t_expand = t.repeat(latent_model_input.shape[0])
                 guidance_expand = (
                     torch.tensor(
@@ -1077,21 +1110,50 @@ Please use VaeImageProcessor.postprocess(...) instead"
                 with torch.autocast(
                     device_type="cuda", dtype=target_dtype, enabled=autocast_enabled
                 ):
-                    noise_pred = self.transformer(  # For an input image (129, 192, 336) (1, 256, 256)
-                        latent_model_input,  # [2, 16, 33, 24, 42]
-                        t_expand,  # [2]
-                        text_states=prompt_embeds,  # [2, 256, 4096]
-                        text_mask=prompt_mask,  # [2, 256]
-                        text_states_2=prompt_embeds_2,  # [2, 768]
-                        freqs_cos=freqs_cis[0],  # [seqlen, head_dim]
-                        freqs_sin=freqs_cis[1],  # [seqlen, head_dim]
-                        freqs_cos_cond=freqs_cis_cond[0],  # [seqlen, head_dim]
-                        freqs_sin_cond=freqs_cis_cond[1],  # [seqlen, head_dim]
-                        guidance=guidance_expand,
-                        return_dict=True,
-                    )[
-                        "x"
-                    ]
+                    cur_mode = mode_schedule[i]
+                    if cur_mode == "custom":
+                        noise_pred = self.transformer(  # For an input image (129, 192, 336) (1, 256, 256)
+                            latent_model_input,  # [2, 16, 33, 24, 42]
+                            t_expand,  # [2]
+                            text_states=prompt_embeds,  # [2, 256, 4096]
+                            text_mask=prompt_mask,  # [2, 256]
+                            text_states_2=prompt_embeds_2,  # [2, 768]
+                            freqs_cos=freqs_cis[0],  # [seqlen, head_dim]
+                            freqs_sin=freqs_cis[1],  # [seqlen, head_dim]
+                            freqs_cos_cond=freqs_cis_cond[0],  # [seqlen, head_dim]
+                            freqs_sin_cond=freqs_cis_cond[1],  # [seqlen, head_dim]
+                            guidance=guidance_expand,
+                            indices = use_kernel_indices,
+                            return_dict=True,
+                            use_default_only=False,
+                        )[
+                            "x"
+                        ]
+                    elif cur_mode == "default":
+                        noise_pred = self.transformer(  # For an input image (129, 192, 336) (1, 256, 256)
+                            latent_model_input,  # [2, 16, 33, 24, 42]
+                            t_expand,  # [2]
+                            text_states=prompt_embeds,  # [2, 256, 4096]
+                            text_mask=prompt_mask,  # [2, 256]
+                            text_states_2=prompt_embeds_2,  # [2, 768]
+                            freqs_cos=freqs_cis_full[0],  # [seqlen, head_dim]
+                            freqs_sin=freqs_cis_full[1],  # [seqlen, head_dim]
+                            freqs_cos_cond=freqs_cis_cond[0],  # [seqlen, head_dim]
+                            freqs_sin_cond=freqs_cis_cond[1],  # [seqlen, head_dim]
+                            guidance=guidance_expand,
+                            indices = [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]],
+                            return_dict=True,
+                            use_default_only=True,
+                        )[
+                            "x"
+                        ]
+                    else:
+                        raise ValueError(
+                            f"Unsupported mode {cur_mode} in mode schedule."
+                        )
+                
+                if logger is not None:
+                    logger.debug(f"After transformer {noise_pred.shape=}, {noise_pred.min()=}, {noise_pred.max()=}")
 
                 # perform guidance
                 if self.do_classifier_free_guidance:
@@ -1108,6 +1170,9 @@ Please use VaeImageProcessor.postprocess(...) instead"
                         guidance_rescale=self.guidance_rescale,
                     )
 
+                if logger is not None:
+                    logger.debug(f"after rescale: {noise_pred.shape=}, {noise_pred.min()=}, {noise_pred.max()=}")
+
                 # compute the previous noisy sample x_t -> x_t-1
                 if i2v_mode and i2v_condition_type == "token_replace":
                     latents = self.scheduler.step(
@@ -1117,9 +1182,13 @@ Please use VaeImageProcessor.postprocess(...) instead"
                         [img_latents, latents], dim=2
                     )
                 else:
+                    if logger is not None:
+                        logger.debug(f"before step: {latents.shape=}, {latents.mean()=}, {latents.std()=}, {latents.min()=}, {latents.max()=}")
                     latents = self.scheduler.step(
                         noise_pred, t, latents, **extra_step_kwargs, return_dict=False
                     )[0]
+                    if logger is not None:
+                        logger.debug(f"after step: {latents.shape=}, {latents.mean()=}, {latents.std()=}, {latents.min()=}, {latents.max()=}")
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
@@ -1175,10 +1244,26 @@ Please use VaeImageProcessor.postprocess(...) instead"
                 device_type="cuda", dtype=vae_dtype, enabled=vae_autocast_enabled
             ):
                 if enable_tiling:
+                    # print("siuuuuuu~~~~~~~")
                     self.vae.enable_tiling()
+                    # print(f"{type(latents)=}")
+                    # print(f"{type(img_latents)=}")
+                    # print(f"{latents.shape=}")
+                    # print(f"{img_latents.shape=}")
                     image = self.vae.decode(
                         latents, return_dict=False, generator=generator
                     )[0]
+                    # img_latents = img_latents / self.vae.config.scaling_factor
+                    # if (
+                    #     hasattr(self.vae.config, "shift_factor")
+                    #     and self.vae.config.shift_factor
+                    # ):
+                    #     img_latents = (
+                    #         img_latents + self.vae.config.shift_factor
+                    # )
+                    # image = self.vae.decode(
+                    #     img_latents, return_dict=False, generator=generator
+                    # )[0]
                 else:
                     image = self.vae.decode(
                         latents, return_dict=False, generator=generator
@@ -1194,11 +1279,11 @@ Please use VaeImageProcessor.postprocess(...) instead"
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
         image = image.cpu().float()
 
-        if i2v_mode and i2v_condition_type == "latent_concat":
-            image = image[:, :, 4:, :, :]
+        # if i2v_mode and i2v_condition_type == "latent_concat":
+        #     image = image[:, :, 4:, :, :]
         
         # split rgb and depth, process depth output separately
-        half_height = (height - 16) // 2
+        half_height = (height - 64) // 2
         rgb = image[..., :half_height, :]
         depth = image[..., -half_height:, :]
         depth = depth[:, 0] * 0.299 + depth[:, 1] * 0.587 + depth[:, 2] * 0.114

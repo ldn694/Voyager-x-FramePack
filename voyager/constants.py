@@ -108,7 +108,7 @@ NORMALIZATION_TYPE = {"layer", "rms"}
 ACTIVATION_TYPE = {"relu", "silu", "gelu", "gelu_tanh"}
 
 # =================== Model Path =====================
-MODEL_BASE = os.getenv("MODEL_BASE", "/root/ckpts")
+MODEL_BASE = os.getenv("MODEL_BASE", "ckpts")
 
 # =================== Data =======================
 DATA_TYPE = {"image", "video", "image_video"}

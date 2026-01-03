@@ -60,6 +60,13 @@ def add_realestate10K_eval_args(parser: argparse.ArgumentParser):
     group = parser.add_argument_group(title="RealEstate10K Evaluation args")
 
     group.add_argument(
+        "--message",
+        type=str,
+        default="",
+        help="Just a message for other people on the server"
+    )
+
+    group.add_argument(
         "--dataset-path",
         type=str,
         default="dataset/RealEstate10K/refined_test_150",
@@ -683,6 +690,20 @@ def add_inference_args(parser: argparse.ArgumentParser):
         "--reproduce",
         action="store_true",
         help="Enable reproducibility by setting random seeds and deterministic algorithms.",
+    )
+
+    # Mode per step configuration
+    group.add_argument(
+        "--mode-scheduler-name",
+        type=str,
+        default="default_scheduler",
+        help="Mode scheduler name for inference."
+    )
+    group.add_argument(
+        "--ratio",
+        type=float,
+        default=1.0,
+        help="Ratio for mode scheduler in inference."
     )
 
     return parser

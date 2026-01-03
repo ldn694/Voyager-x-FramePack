@@ -1079,6 +1079,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         guidance: torch.Tensor = None,
         return_dict: bool = True,
         indices: Optional[List[int]] = None,
+        use_default_only: bool = False,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         logger.debug(f"{x.shape=} {x.min()=} {x.max()=} {x.mean()=}")
         logger.debug(f"latent {x[:, :16, :, :, :].shape=} {x[:, :16, :, :, :].min()=} {x[:, :16, :, :, :].max()=} {x[:, :16, :, :, :].mean()=}")
@@ -1136,7 +1137,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             condition = condition[..., -height:, :]  # depth
             condition = self.condition_in(condition)
 
-        if self.patch_sizes is not None:
+        if self.patch_sizes is not None and not use_default_only:
             img, patch_indices = self.img_in(img, indices=indices)
             assert torch.all(patch_indices == patch_indices[0:1]), \
                 "patch_indices differ across batch: cannot index shared RoPE [N,*] with batch-dependent masks."
@@ -1160,7 +1161,10 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
 
                 vec_second_branch = self.time_in_second_branch(t)
         else:
-            img = self.img_in(img)
+            if use_default_only and hasattr(self, "old_img_in"):
+                img = self.old_img_in(img)
+            else:
+                img = self.img_in(img)
         
         if self.text_projection == "linear":
             txt = self.txt_in(txt)
@@ -1172,7 +1176,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                 f"Unsupported text_projection: {self.text_projection}"
             )
         
-        if self.patch_sizes is not None and self.use_second_branch:
+        if self.patch_sizes is not None and self.use_second_branch and not use_default_only:
             prev_first_branch_index = -1
             prev_second_branch_index = -1
             no_text_mask = torch.zeros(
@@ -1465,8 +1469,11 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
 
         # ---------------------------- Final layer ------------------------------
         # (N, T, patch_size ** 2 * out_channels)
-        if self.patch_sizes is None:
-            img = self.final_layer(img, vec)
+        if self.patch_sizes is None or use_default_only:
+            if use_default_only and hasattr(self, "old_final_layer"):
+                img = self.old_final_layer(img, vec)
+            else:
+                img = self.final_layer(img, vec)
             img = self.unpatchify(img, tt, th, tw)
         else:
             img = self.final_layer(img, vec, indices=indices, patch_indices=patch_indices)

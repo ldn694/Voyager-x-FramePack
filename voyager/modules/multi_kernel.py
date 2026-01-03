@@ -98,6 +98,7 @@ def apply_multikernel_to_hunyuan_video(
             if bias and old_conv.bias is not None:
                 new_img_in.projs[0].bias.copy_(old_conv.bias)
 
+    model.old_img_in = old_img_in
     model.img_in = new_img_in
 
     # -----------------------------------------------------------
@@ -140,6 +141,7 @@ def apply_multikernel_to_hunyuan_video(
             new_final.linears[0].weight.copy_(old_final.linear.weight)
             new_final.linears[0].bias.copy_(old_final.linear.bias)
 
+    model.old_final_layer = old_final
     model.final_layer = new_final
 
     if freeze_base:
