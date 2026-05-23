@@ -26,7 +26,22 @@ from voyager.diffusion.flow import Transport
 from voyager.utils.train_utils import set_reproducibility, prepare_model_inputs, get_training_output_dir, get_synchronized_training_output_dir
 from voyager.utils.file_utils import save_videos_grid
 from voyager.inference import load_models
-from voyager.modules.lora_layers import apply_lora_to_hunyuan_video, get_lora_parameters, get_lora_state_dict, load_lora_state_dict
+from voyager.modules.lora_layers import (
+    apply_lora_to_hunyuan_video,
+    get_lora_parameters,
+    get_lora_state_dict,
+    load_lora_state_dict,
+    set_active_lora_adapter,
+)
+from voyager.diffusion.dmd2 import (
+    DMD2Config,
+    dmd2_config_from_args,
+    uniform_timestep_grid,
+    make_xt_linear_reverse,
+    compute_x_hat_0_from_velocity,
+    compute_dmd2_generator_loss,
+    compute_fake_score_loss,
+)
 from voyager.modules.custom_patch_embed import apply_patch_adapter_to_hunyuan_video, get_patch_adapter_parameters, get_patch_adapter_state_dict, load_patch_adapter_state_dict
 from voyager.modules.multi_kernel import apply_multikernel_to_hunyuan_video, get_multikernel_parameters, get_multikernel_state_dict, load_multikernel_state_dict
 from voyager.modules.double_branch import apply_double_branch_to_hunyuan_video, get_double_branch_parameters, get_double_branch_state_dict, load_double_branch_state_dict, TransformerBranchConfig
@@ -181,6 +196,7 @@ def parse_arg():
     parser = add_patch_adapter_args(parser)
     parser = add_multiple_kernel_args(parser)
     parser = add_double_branch_args(parser)
+    parser = add_dmd2_args(parser)
 
     args = parser.parse_args()
     args.kernel_sizes = as_list_of_3tuple(args.kernel_sizes) if args.kernel_sizes is not None else None
@@ -375,6 +391,24 @@ def save_lora_checkpoint(model_engine, args, epoch, step, training_output_dir):
             logger.info(f"Saving LoRA checkpoint to {ckpt_path}")
             torch.save(ckpt, ckpt_path)
 
+
+def save_dmd2_lora_checkpoint(model_engine, args, epoch, step, training_output_dir, adapter_name: str, filename: str):
+    """Save a single named LoRA adapter (e.g. 'gen' or 'fake' for DMD2)."""
+    params = get_lora_parameters(model_engine.module, adapter_name=adapter_name)
+    with deepspeed.zero.GatheredParameters(params, modifier_rank=0):
+        if dist.get_rank() == 0:
+            sd = get_lora_state_dict(model_engine.module, adapter_name=adapter_name)
+            ckpt = {
+                "epoch": epoch,
+                "step_in_epoch": step,
+                "lora": sd,
+                "adapter_name": adapter_name,
+                "args": vars(args),
+            }
+            ckpt_path = Path(training_output_dir) / filename
+            logger.info(f"Saving DMD2 {adapter_name} LoRA checkpoint to {ckpt_path}")
+            torch.save(ckpt, ckpt_path)
+
 def save_patch_adapter_checkpoint(model_engine, args, epoch, step, training_output_dir):
     """
     Gather and save only patch-adapter parameters (PatchEmbed + FinalLayer)
@@ -443,13 +477,131 @@ def save_double_branch_checkpoint(model_engine, args, epoch, step, training_outp
             logger.info(f"Saving Double Branch checkpoint to {ckpt_path}")
             torch.save(ckpt, ckpt_path)
 
+def make_dmd2_forward_v(model_engine, denoiser, args, *, cond_latents, partial_cond, partial_mask, model_kwargs):
+    """
+    Build a closure used by the DMD2 loss functions to issue a single model
+    forward, abstracting away the adapter routing, the i2v conditioning concat,
+    and the timestep-to-model-input-scale conversion.
+
+    Signature: forward_v(adapter_name_or_None, x_t_data, t) -> v_pred
+        - adapter_name_or_None: pass None for the base (LoRA-off) "real" score.
+        - x_t_data:             (B, latent_channels, T, H', W')
+        - t:                    (B,) in [0, 1]
+    Returns:
+        v_pred over the *data* channels with the same shape as x_t_data.
+    """
+
+    def _forward_v(adapter, x_t_data, t):
+        set_active_lora_adapter(model_engine.module, adapter)
+
+        # i2v latent_concat: concat [x_t, first-frame-only cond, first-frame-only mask]
+        # along the channel dim. Mirrors voyager/diffusion/flow/transport.py:training_losses.
+        if args.i2v_mode and args.i2v_condition_type == "latent_concat":
+            B_, _, T_, H_, W_ = x_t_data.shape
+            x1_concat = cond_latents.repeat(1, 1, T_, 1, 1).clone()
+            x1_concat[:, :, 1:, :, :] = 0.0
+            mask_concat = torch.ones(
+                B_, 1, T_, H_, W_,
+                device=x_t_data.device, dtype=x_t_data.dtype,
+            )
+            mask_concat[:, :, 1:, ...] = 0.0
+            xt = torch.cat([x_t_data, x1_concat, mask_concat], dim=1)
+        elif args.i2v_mode and args.i2v_condition_type == "token_replace":
+            xt = torch.cat([cond_latents, x_t_data[:, :, 1:, :, :]], dim=2)
+        else:
+            xt = x_t_data
+
+        if partial_cond is not None and partial_mask is not None:
+            xt = torch.cat([xt, partial_cond, partial_mask], dim=1)
+
+        input_t = denoiser.get_model_t(t).to(x_t_data.device)
+        xt = xt.to(model_engine.module.dtype)
+
+        out = model_engine(xt, input_t, **model_kwargs)["x"]
+
+        if args.i2v_mode and args.i2v_condition_type == "token_replace":
+            out = out[:, :, 1:, :, :]
+
+        return out
+
+    return _forward_v
+
+
+def _sample_t_i_from_grid(batch_size: int, t_grid: torch.Tensor, device) -> torch.Tensor:
+    """One uniformly-sampled t_i per batch element from the DMD2 grid."""
+    idx = torch.randint(0, t_grid.shape[0], (batch_size,), device=device)
+    return t_grid[idx].to(torch.float32)
+
+
+def dmd2_fake_step(model_engine, denoiser, args, dmd2_cfg, t_grid, latents, forward_v):
+    """One fake-score update. Returns the loss scalar."""
+    model_engine.train()
+    B = latents.shape[0]
+    t_i = _sample_t_i_from_grid(B, t_grid, latents.device)
+
+    with torch.no_grad():
+        noise = torch.randn_like(latents)
+        x_t_in = make_xt_linear_reverse(latents, noise, t_i)
+        v_pred = forward_v(dmd2_cfg.gen_adapter_name, x_t_in, t_i)
+        x_hat_0 = compute_x_hat_0_from_velocity(x_t_in, v_pred, t_i).detach()
+
+    target_dtype = PRECISION_TO_TYPE[args.precision]
+    autocast_enabled = (target_dtype != torch.float32) and not args.disable_autocast
+    with torch.autocast(device_type="cuda", dtype=model_engine.module.dtype, enabled=autocast_enabled):
+        fake_loss, _ = compute_fake_score_loss(
+            x_hat_0,
+            forward_v,
+            min_tp=dmd2_cfg.min_tp,
+            max_tp=dmd2_cfg.max_tp,
+            fake_adapter=dmd2_cfg.fake_adapter_name,
+        )
+
+    model_engine.backward(fake_loss)
+    model_engine.step()
+    return float(fake_loss.detach().item())
+
+
+def dmd2_gen_step(model_engine, denoiser, args, dmd2_cfg, t_grid, latents, forward_v):
+    """One generator update. Returns the surrogate-loss scalar."""
+    model_engine.train()
+    B = latents.shape[0]
+    t_i = _sample_t_i_from_grid(B, t_grid, latents.device)
+
+    target_dtype = PRECISION_TO_TYPE[args.precision]
+    autocast_enabled = (target_dtype != torch.float32) and not args.disable_autocast
+    with torch.autocast(device_type="cuda", dtype=model_engine.module.dtype, enabled=autocast_enabled):
+        noise = torch.randn_like(latents)
+        x_t_in = make_xt_linear_reverse(latents, noise, t_i)
+        v_pred = forward_v(dmd2_cfg.gen_adapter_name, x_t_in, t_i)
+        x_hat_0 = compute_x_hat_0_from_velocity(x_t_in, v_pred, t_i)
+
+        gen_loss, _ = compute_dmd2_generator_loss(
+            x_hat_0,
+            forward_v,
+            min_tp=dmd2_cfg.min_tp,
+            max_tp=dmd2_cfg.max_tp,
+            weight_mode=dmd2_cfg.weight_mode,
+            real_adapter=None,
+            fake_adapter=dmd2_cfg.fake_adapter_name,
+        )
+
+    model_engine.backward(gen_loss)
+    model_engine.step()
+    return float(gen_loss.detach().item())
+
+
 def save_ckpt(args, model_engine, epoch, step, training_output_dir, total_skip):
     logger.warning(f"Skipped {total_skip} batches due to NaN/Inf so far.")
     if args.train_from_scratch:
         ckpt_path = Path(training_output_dir) / f"model_{args.model}_last.pt"
         logger.info(f"Saving full model checkpoint to {ckpt_path}")
         save_full_model_checkpoint(model_engine, args, epoch, step, training_output_dir)
-    if args.train_lora:
+    if getattr(args, "dmd2_steps", 0) > 0 and args.train_lora:
+        # In DMD2 mode we save BOTH adapters separately and skip the legacy
+        # single-adapter save (which would mix gen+fake into one file).
+        save_dmd2_lora_checkpoint(model_engine, args, epoch, step, training_output_dir, "gen", "lora_gen_last.pt")
+        save_dmd2_lora_checkpoint(model_engine, args, epoch, step, training_output_dir, "fake", "lora_fake_last.pt")
+    elif args.train_lora:
         lora_ckpt_path = Path(training_output_dir) / f"lora_last.pt"
         logger.info(f"Saving LoRA checkpoint to {lora_ckpt_path}")
         save_lora_checkpoint(model_engine, args, epoch, step, training_output_dir)
@@ -551,15 +703,45 @@ if __name__ == "__main__":
 
     #===================MODEL MODIFICATIONS & OPTIMIZER===================#
 
+    dmd2_active = getattr(args, "dmd2_steps", 0) > 0
+    if dmd2_active and not args.train_lora:
+        raise ValueError("--dmd2-steps requires --train-lora (DMD2 uses LoRA adapters for the generator).")
+
     if args.train_lora:
         logger.info("Applying LoRA adapters to model...")
-        apply_lora_to_hunyuan_video(
-            model,
-            r=args.lora_rank if hasattr(args, "lora_rank") else 8,
-            lora_alpha=args.lora_alpha if hasattr(args, "lora_alpha") else 16.0,
-            lora_dropout=getattr(args, "lora_dropout", 0.0),
-            freeze_base=not args.train_from_scratch
-        )
+        # In DMD2 mode we attach TWO named adapters on top of the same frozen base:
+        # "gen"  = the few-step generator being distilled
+        # "fake" = the fake-score critic
+        if dmd2_active:
+            apply_lora_to_hunyuan_video(
+                model,
+                r=args.lora_rank,
+                lora_alpha=getattr(args, "lora_alpha", 16.0),
+                lora_dropout=getattr(args, "lora_dropout", 0.0),
+                freeze_base=not args.train_from_scratch,
+                adapter_name="gen",
+            )
+            fake_r = args.dmd2_fake_lora_rank or args.lora_rank
+            fake_alpha = args.dmd2_fake_lora_alpha if args.dmd2_fake_lora_alpha is not None else getattr(args, "lora_alpha", 16.0)
+            apply_lora_to_hunyuan_video(
+                model,
+                r=fake_r,
+                lora_alpha=fake_alpha,
+                lora_dropout=getattr(args, "lora_dropout", 0.0),
+                freeze_base=False,  # base is already frozen by the gen-adapter call
+                adapter_name="fake",
+            )
+            # Default routing: generator active. The DMD2 inner loop flips this per call.
+            set_active_lora_adapter(model, "gen")
+            logger.info(f"DMD2 active: applied 'gen' (rank {args.lora_rank}) + 'fake' (rank {fake_r}) LoRA adapters.")
+        else:
+            apply_lora_to_hunyuan_video(
+                model,
+                r=args.lora_rank if hasattr(args, "lora_rank") else 8,
+                lora_alpha=args.lora_alpha if hasattr(args, "lora_alpha") else 16.0,
+                lora_dropout=getattr(args, "lora_dropout", 0.0),
+                freeze_base=not args.train_from_scratch
+            )
     if args.patch_adapter_size is not None:
         logger.warning(f"Applying Patch Size Adapters with new patch size: {args.patch_adapter_size}")
         apply_patch_adapter_to_hunyuan_video(
@@ -633,8 +815,10 @@ if __name__ == "__main__":
         logger.info(f"Resuming LoRA from {args.resume_lora}")
         ckpt = torch.load(args.resume_lora, map_location='cpu', weights_only=False)
 
-        # Load LoRA weights into the wrapped model
-        load_lora_state_dict(model, ckpt["lora"], strict=False)
+        # In DMD2 mode this checkpoint targets the "gen" adapter; otherwise the legacy
+        # single-adapter path (default name) is used.
+        target_adapter = "gen" if dmd2_active else None
+        load_lora_state_dict(model, ckpt["lora"], strict=False, adapter_name=target_adapter)
 
         # Optional: resume optimizer state if you saved it
         if "optimizer" in ckpt:
@@ -652,6 +836,12 @@ if __name__ == "__main__":
         )
     else:
         logger.info("No LoRA resume checkpoint provided.")
+
+    if dmd2_active and args.resume_dmd2_fake_lora is not None and os.path.isfile(args.resume_dmd2_fake_lora):
+        logger.info(f"Resuming DMD2 fake-score LoRA from {args.resume_dmd2_fake_lora}")
+        ckpt = torch.load(args.resume_dmd2_fake_lora, map_location='cpu', weights_only=False)
+        load_lora_state_dict(model, ckpt["lora"], strict=False, adapter_name="fake")
+        logger.info("Resumed fake-score LoRA.")
     
     if args.resume_multi_kernel is not None and os.path.isfile(args.resume_multi_kernel):
         logger.info(f"Resuming Multi-Kernel from {args.resume_multi_kernel}")
@@ -708,7 +898,28 @@ if __name__ == "__main__":
     )
     steps_per_update = model_engine.gradient_accumulation_steps()
     logger.info(f"Grad accumulation steps: {steps_per_update}")
-    
+
+    #===================DMD2 RUNTIME SETUP===================#
+
+    if dmd2_active:
+        dmd2_cfg = dmd2_config_from_args(args)
+        if steps_per_update != 1:
+            raise ValueError(
+                f"DMD2 requires gradient_accumulation_steps == 1 in the DeepSpeed config "
+                f"(got {steps_per_update}). The two-timescale loop performs a full "
+                f"optimizer step per fake/gen update; accumulation would entangle them."
+            )
+        t_grid = uniform_timestep_grid(dmd2_cfg.num_steps, device=args.device)
+        dmd2_outer_step = 0
+        logger.info(
+            f"DMD2 enabled | num_steps={dmd2_cfg.num_steps} | "
+            f"K_fake={dmd2_cfg.fake_updates_per_gen} | "
+            f"warmup={dmd2_cfg.fake_warmup_steps} | "
+            f"weight_mode={dmd2_cfg.weight_mode} | "
+            f"t_p in [{dmd2_cfg.min_tp}, {dmd2_cfg.max_tp}]"
+        )
+        logger.info(f"DMD2 t_grid: {t_grid.tolist()}")
+
     #===================TRAINING LOOP===================#
     loss_values = []
     avg_loss_values = []
@@ -875,17 +1086,54 @@ if __name__ == "__main__":
             # save_videos_grid(image, "/raid/hvtham/ldnhuan/HunyuanWorld-Voyager/debug.mp4", fps=24)
             # # END DEBUG
 
-            loss, input_t = training_step(
-                latents,
-                cond_latents,
-                model_engine,
-                denoiser,
-                args,
-                model_kwargs=model_kwargs,
-                partial_cond=partial_cond,
-                partial_mask=partial_mask,
-                return_all_terms=True,
-            )
+            if dmd2_active:
+                # ----- DMD2 two-timescale step -----
+                forward_v = make_dmd2_forward_v(
+                    model_engine, denoiser, args,
+                    cond_latents=cond_latents,
+                    partial_cond=partial_cond,
+                    partial_mask=partial_mask,
+                    model_kwargs=model_kwargs,
+                )
+
+                fake_loss_vals = []
+                for _ in range(dmd2_cfg.fake_updates_per_gen):
+                    fake_loss_vals.append(
+                        dmd2_fake_step(model_engine, denoiser, args, dmd2_cfg, t_grid, latents, forward_v)
+                    )
+
+                do_gen_update = dmd2_outer_step >= dmd2_cfg.fake_warmup_steps
+                gen_loss_val = None
+                if do_gen_update:
+                    gen_loss_val = dmd2_gen_step(model_engine, denoiser, args, dmd2_cfg, t_grid, latents, forward_v)
+
+                dmd2_outer_step += 1
+
+                avg_fake = sum(fake_loss_vals) / max(1, len(fake_loss_vals))
+                if gen_loss_val is not None:
+                    logger.info(
+                        f"[DMD2 outer={dmd2_outer_step}] fake_loss_avg={avg_fake:.4f} gen_loss={gen_loss_val:.4f}"
+                    )
+                else:
+                    logger.info(
+                        f"[DMD2 outer={dmd2_outer_step}] fake_loss_avg={avg_fake:.4f} gen=warmup({dmd2_outer_step}/{dmd2_cfg.fake_warmup_steps})"
+                    )
+
+                # Surface a scalar for the rest of the loop's bookkeeping (loss logs, checkpoints).
+                loss = gen_loss_val if gen_loss_val is not None else avg_fake
+                input_t = []
+            else:
+                loss, input_t = training_step(
+                    latents,
+                    cond_latents,
+                    model_engine,
+                    denoiser,
+                    args,
+                    model_kwargs=model_kwargs,
+                    partial_cond=partial_cond,
+                    partial_mask=partial_mask,
+                    return_all_terms=True,
+                )
 
             global_step = epoch * len(dataloader) + step
             effective_update = (global_step + 1) // steps_per_update

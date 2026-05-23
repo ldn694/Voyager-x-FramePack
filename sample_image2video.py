@@ -98,6 +98,7 @@ def main():
         use_kernel_indices = args.use_kernel_indices if args.use_kernel_indices is not None else None,
         step_sample = args.step_sample,
         attn_map = args.attn_map,
+        dmd2_steps = getattr(args, "dmd2_steps", 0),
     )
     samples = outputs['samples']
 

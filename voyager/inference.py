@@ -314,14 +314,18 @@ def load_models(args, device, logger, pretrained_model_path):
         lora_ckpt = torch.load(args.lora_path, map_location="cpu", weights_only=False)
         lora_args = lora_ckpt["args"]
         logger.info(lora_args)
+        # If running the DMD2 inference path, the saved adapter is "gen" with
+        # adapter-agnostic keys; route it explicitly so multi-adapter routing works.
+        dmd2_target = "gen" if getattr(args, "dmd2_steps", 0) > 0 else None
         apply_lora_to_hunyuan_video(
             model,
             r=lora_args["lora_rank"] if "lora_rank" in lora_args else 4,
             lora_alpha=lora_args["lora_alpha"] if "lora_alpha" in lora_args else 16.0,
             lora_dropout=lora_args["lora_dropout"] if "lora_dropout" in lora_args else 0.0,
             freeze_base=True,
+            adapter_name=dmd2_target if dmd2_target is not None else "default",
         )
-        load_lora_state_dict(model, lora_ckpt["lora"], strict=False)
+        load_lora_state_dict(model, lora_ckpt["lora"], strict=False, adapter_name=dmd2_target)
     if args.use_patch_adapter and args.patch_adapter_path is not None:
         logger.info(f"Loading Patch Adapter from {args.patch_adapter_path}...")
         patch_adapter_ckpt = torch.load(args.patch_adapter_path, map_location="cpu", weights_only=False)
@@ -852,6 +856,7 @@ class HunyuanVideoSampler(Inference):
         use_kernel_indices=None,
         step_sample=0,
         attn_map=0,
+        dmd2_steps=0,
         **kwargs,
     ):
         out_dict = dict()
@@ -1144,7 +1149,8 @@ class HunyuanVideoSampler(Inference):
             logger=logger,
             mode_scheduler_name=self.args.mode_scheduler_name,
             step_sample = step_sample,
-            attn_map = attn_map
+            attn_map = attn_map,
+            dmd2_steps = dmd2_steps,
         )[0]
 
 

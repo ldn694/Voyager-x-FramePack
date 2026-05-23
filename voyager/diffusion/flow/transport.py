@@ -171,6 +171,24 @@ class Transport:
         else:
             return t * self.training_timesteps
 
+    def alpha_sigma(self, t, ref_x: th.Tensor):
+        """
+        Return (alpha_t, sigma_t) broadcastable to `ref_x.shape`.
+        Used by DMD2 so external code doesn't reimplement path math.
+        """
+        t_exp = path.expand_t_like_x(t, ref_x)
+        alpha_t, _ = self.path_sampler.compute_alpha_t(t_exp)
+        sigma_t, _ = self.path_sampler.compute_sigma_t(t_exp)
+        return alpha_t, sigma_t
+
+    def compute_flow_target(self, x0: th.Tensor, x1: th.Tensor, t: th.Tensor):
+        """
+        Public wrapper around path_sampler.plan: returns (x_t, v_target) for the
+        current flow-matching path. `x0` is noise, `x1` is data (matches Transport.sample).
+        """
+        _, xt, ut = self.path_sampler.plan(t, x0, x1)
+        return xt, ut
+
     def training_losses(self, model, x1, model_kwargs=None, timestep=None, n_tokens=None,
                         i2v_mode=False, cond_latents=None, args=None, partial_cond=None, partial_mask=None, t_range=None):
 

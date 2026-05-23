@@ -33,7 +33,8 @@ def parse_args(mode="eval", namespace=None):
     parser = add_double_branch_args(parser)
     parser = add_step_sample_args(parser)
     parser = add_attn_map_args(parser)
-    
+    parser = add_dmd2_args(parser)
+
     if "eval_realestate10K" in mode:
         parser = add_realestate10K_eval_args(parser)
     
@@ -925,6 +926,86 @@ def add_attn_map_args(parser: argparse.ArgumentParser):
     return parser
 
 
+def add_dmd2_args(parser: argparse.ArgumentParser):
+    """
+    DMD2 (Distribution Matching Distillation v2) + LoRA distillation.
+
+    Pass `--dmd2-steps N` (N > 0) together with `--train-lora` to switch the
+    training loop into DMD2 mode. At inference, pass `--dmd2-steps N` to
+    run the N-step generator instead of the full 50-step denoising loop.
+    """
+    group = parser.add_argument_group(title="DMD2 distillation")
+
+    group.add_argument(
+        "--dmd2-steps",
+        type=int,
+        default=0,
+        help="Number of generator timesteps for DMD2 distillation. "
+             "0 disables DMD2 and runs standard flow-matching training/inference.",
+    )
+    group.add_argument(
+        "--dmd2-fake-updates-per-gen",
+        type=int,
+        default=5,
+        help="K_fake: number of fake-score updates between successive generator updates.",
+    )
+    group.add_argument(
+        "--dmd2-fake-warmup-steps",
+        type=int,
+        default=200,
+        help="Initial fake-only updates before the first generator update.",
+    )
+    group.add_argument(
+        "--dmd2-fake-lora-rank",
+        type=int,
+        default=None,
+        help="LoRA rank for the fake-score adapter. Defaults to --lora-rank.",
+    )
+    group.add_argument(
+        "--dmd2-fake-lora-alpha",
+        type=float,
+        default=None,
+        help="LoRA alpha for the fake-score adapter. Defaults to --lora-alpha.",
+    )
+    group.add_argument(
+        "--dmd2-weight-mode",
+        choices=["normalized", "uniform"],
+        default="normalized",
+        help="Per-sample DMD2 generator-loss weight. normalized = 1/mean(|x_hat_0|).",
+    )
+    group.add_argument(
+        "--dmd2-min-tp",
+        type=float,
+        default=0.02,
+        help="Lower bound for the perturbation timestep t_p.",
+    )
+    group.add_argument(
+        "--dmd2-max-tp",
+        type=float,
+        default=0.98,
+        help="Upper bound for the perturbation timestep t_p.",
+    )
+    group.add_argument(
+        "--dmd2-cfg-scale-real",
+        type=float,
+        default=1.0,
+        help="Optional CFG scale on the real-score forward. 1.0 disables (cheaper).",
+    )
+    group.add_argument(
+        "--dmd2-fake-lr-mult",
+        type=float,
+        default=1.0,
+        help="Multiplier on --lr for the fake-score optimizer's learning rate.",
+    )
+    group.add_argument(
+        "--resume-dmd2-fake-lora",
+        type=str,
+        default=None,
+        help="Path to a fake-score LoRA checkpoint (.pt) to resume from.",
+    )
+    return parser
+
+
 def sanity_check_args(args):
     """Validate and sanity check parsed arguments
     
@@ -964,5 +1045,13 @@ def sanity_check_args(args):
         raise ValueError(
             f"Latent channels ({args.latent_channels}) must match the VAE channels ({vae_channels})."
         )
+
+    # DMD2 invariants
+    if getattr(args, "dmd2_steps", 0) and args.dmd2_steps > 0:
+        if not getattr(args, "flow_reverse", False):
+            raise ValueError(
+                "--dmd2-steps requires --flow-reverse (the DMD2 loss formulas in "
+                "voyager/diffusion/dmd2/dmd2_loss.py assume the linear-reverse path)."
+            )
     return args
 

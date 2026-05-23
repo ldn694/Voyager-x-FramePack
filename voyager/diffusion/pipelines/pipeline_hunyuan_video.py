@@ -753,6 +753,7 @@ Please use VaeImageProcessor.postprocess(...) instead"
         freqs_cis_full: Tuple[torch.Tensor, torch.Tensor] = None,
         step_sample: int = 0,
         attn_map: int = 0,
+        dmd2_steps: int = 0,
         **kwargs,
     ):
         r"""
@@ -977,6 +978,17 @@ Please use VaeImageProcessor.postprocess(...) instead"
             **extra_set_timesteps_kwargs,
         )
 
+        # DMD2: override the scheduler's timesteps with a uniform [0,1]*1000 grid.
+        # The teacher's flow-shift schedule is intentionally ignored — DMD2 generator
+        # was trained on uniform t_i (see voyager/diffusion/dmd2/timestep_grid.py).
+        if dmd2_steps and dmd2_steps > 0:
+            from voyager.diffusion.dmd2 import uniform_timestep_grid as _dmd2_uniform_grid
+            t_grid_norm = _dmd2_uniform_grid(dmd2_steps, device=device, dtype=torch.float32)
+            timesteps = (t_grid_norm * 1000.0).to(device=device, dtype=timesteps.dtype)
+            num_inference_steps = dmd2_steps
+            if logger is not None:
+                logger.info(f"DMD2 inference: overriding timesteps to {timesteps.tolist()}")
+
         if "884" in vae_ver:
             video_length = (video_length - 1) // 4 + 1
         elif "888" in vae_ver:
@@ -1061,6 +1073,10 @@ Please use VaeImageProcessor.postprocess(...) instead"
 
         mode_schedule_name = kwargs.get("mode_scheduler_name", None)
         mode_schedule = sampler_scheduler.get_scheduler(mode_schedule_name, self.args)
+        if dmd2_steps and dmd2_steps > 0:
+            # DMD2 generator LoRA must be active for every step; ignore any custom
+            # ratio/scheduler the user may have passed.
+            mode_schedule = ["custom"] * num_inference_steps
         logger.info(f"Using mode schedule: {mode_schedule}")
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -1187,7 +1203,34 @@ Please use VaeImageProcessor.postprocess(...) instead"
                     logger.debug(f"after rescale: {noise_pred.shape=}, {noise_pred.min()=}, {noise_pred.max()=}")
 
                 # compute the previous noisy sample x_t -> x_t-1
-                if i2v_mode and i2v_condition_type == "token_replace":
+                if dmd2_steps and dmd2_steps > 0:
+                    # DMD2 N-step update (linear-reverse path):
+                    #   t_norm  = t / 1000
+                    #   x_hat_0 = x_t - t_norm * v_pred
+                    #   if more steps: x_t = (1 - t_next) * x_hat_0 + t_next * eps
+                    #   else:          x_t = x_hat_0
+                    t_norm = (t.to(torch.float32) / 1000.0)
+                    t_norm_b = t_norm.view(*([1] * latents.dim()))
+                    if i2v_mode and i2v_condition_type == "token_replace":
+                        v = noise_pred[:, :, 1:, :, :]
+                        x_body = latents[:, :, 1:, :, :]
+                        x_hat_0 = x_body - t_norm_b * v
+                        if i < num_inference_steps - 1:
+                            t_next = (timesteps[i + 1].to(torch.float32) / 1000.0).view(*([1] * x_hat_0.dim()))
+                            eps_next = torch.randn_like(x_hat_0)
+                            x_new = (1.0 - t_next) * x_hat_0 + t_next * eps_next
+                        else:
+                            x_new = x_hat_0
+                        latents = torch.concat([img_latents, x_new], dim=2)
+                    else:
+                        x_hat_0 = latents - t_norm_b * noise_pred
+                        if i < num_inference_steps - 1:
+                            t_next = (timesteps[i + 1].to(torch.float32) / 1000.0).view(*([1] * x_hat_0.dim()))
+                            eps_next = torch.randn_like(x_hat_0)
+                            latents = (1.0 - t_next) * x_hat_0 + t_next * eps_next
+                        else:
+                            latents = x_hat_0
+                elif i2v_mode and i2v_condition_type == "token_replace":
                     latents = self.scheduler.step(
                         noise_pred[:, :, 1:, :, :], t, latents[:, :, 1:, :, :], **extra_step_kwargs, return_dict=False
                     )[0]
