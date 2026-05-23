@@ -31,6 +31,8 @@ def parse_args(mode="eval", namespace=None):
     parser = add_patch_adapter_args(parser)
     parser = add_multiple_kernel_args(parser)
     parser = add_double_branch_args(parser)
+    parser = add_step_sample_args(parser)
+    parser = add_attn_map_args(parser)
     
     if "eval_realestate10K" in mode:
         parser = add_realestate10K_eval_args(parser)
@@ -177,6 +179,8 @@ def add_data_args(parser: argparse.ArgumentParser):
                        help="Probability of randomly dropping video description.")
     group.add_argument("--sematic-cond-drop-p", type=float, default=0.1,
                        help="Probability of randomly dropping img condition description.")
+    group.add_argument("--use-gt-as-cond", action="store_true",
+                       help="Use ground truth frames as image condition.")
 
     return parser
 
@@ -250,6 +254,10 @@ def add_training_args(parser: argparse.ArgumentParser):
     # Early stopping
     group.add_argument("--early-stop-training-loss", type=float, default=None,
                        help="Early stop training if the loss is below this value.")
+
+    # Sample time range
+    group.add_argument("--sample-time-range", type=float, nargs=2, default=None,
+                       help="Time range for sampling during training. Only sample time steps within this range. The range should be in [0, 1000]")
     return parser
 
 
@@ -705,6 +713,24 @@ def add_inference_args(parser: argparse.ArgumentParser):
         default=1.0,
         help="Ratio for mode scheduler in inference."
     )
+    group.add_argument(
+        "--start",
+        type=int,
+        nargs="+",            # accept multiple ints per occurrence
+        help="Start step for mode scheduler in inference."
+    )
+    group.add_argument(
+        "--end",
+        type=int,
+        nargs="+",            # accept multiple ints per occurrence
+        help="End step for mode scheduler in inference."
+    )
+    group.add_argument(
+        "--step-interval",  
+        type=int,
+        nargs="+",            # accept multiple ints per occurrence
+        help="Step interval for mode scheduler in inference."
+    )
 
     return parser
 
@@ -886,6 +912,19 @@ def add_double_branch_args(parser: argparse.ArgumentParser):
     return parser
 
 
+
+def add_step_sample_args(parser: argparse.ArgumentParser):
+    group = parser.add_argument_group(title="step sample args")
+    group.add_argument("--step-sample", type=int, default=0, help="Save intermediate videos every k steps. 0 to disable.")
+    return parser
+
+
+def add_attn_map_args(parser: argparse.ArgumentParser):
+    group = parser.add_argument_group(title="Stride layer to record attention map")
+    group.add_argument("--attn-map", type=int, default=0, help="Save frame wise attention map every k layers in DiT. 0 to disable.")
+    return parser
+
+
 def sanity_check_args(args):
     """Validate and sanity check parsed arguments
     
@@ -926,3 +965,4 @@ def sanity_check_args(args):
             f"Latent channels ({args.latent_channels}) must match the VAE channels ({vae_channels})."
         )
     return args
+

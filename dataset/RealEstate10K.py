@@ -21,7 +21,9 @@ class RealEstate10K(Dataset):
                  transform=None,
                  width=None,
                  height=None,
-                 return_inverse_depth=False
+                 return_inverse_depth=False,
+                 cameras_name = "cameras",
+                 fixed_start_end=None
                  ):
         '''
         Args:
@@ -37,11 +39,13 @@ class RealEstate10K(Dataset):
         self.frames_intervals = frames_intervals
         self.transform = transform
         self.return_inverse_depth = return_inverse_depth
+        self.cameras_name = cameras_name
+        self.fixed_start_end = fixed_start_end
 
         self.frame_path = os.path.join(self.root_path, 'transcode')
         self.depth_path = os.path.join(self.root_path, 'depth_videos')
         self.depth_ranges_path = os.path.join(self.root_path, 'depth_ranges')
-        self.cameras_path = os.path.join(self.root_path, 'cameras')
+        self.cameras_path = os.path.join(self.root_path, self.cameras_name)
         self.caption_path = os.path.join(self.root_path, 'train_caption.json')
         self.folder_path = os.path.join(self.root_path, self.set_name)
         self.width = width
@@ -160,19 +164,35 @@ class RealEstate10K(Dataset):
         rgb_folder = self.data[index]['rgb_folder']
         depth_video_file = self.data[index]['depth_video_file']
         prompt = self.data[index]['prompt']
+        
+        if self.fixed_start_end is not None:
+            assert isinstance(self.fixed_start_end, tuple) and len(self.fixed_start_end) == 2, "fixed_start_end should be a tuple of (start_index, end_index)"
+            start_index, end_index = self.fixed_start_end
+            if start_index is None:
+                start_index = 0 
+            if end_index is None:
+                end_index = len(frame_infos) - 1
+            def sample_even_spacing(start, end, num):
+                if num == 1:
+                    return [start]
+                
+                step = (end - start) / (num - 1)
+                return [start + round(i * step) for i in range(num)]
+            idxs = sample_even_spacing(start_index, end_index, self.frame_per_sample)
+        else:
+            viable = sorted([iv for iv in self.frames_intervals
+                            if len(frame_infos) >= 1 + (self.frame_per_sample - 1) * iv])
+            if not viable:
+                raise ValueError("Not enough frames for any requested interval.")
+            frame_interval = random.choice(viable)
 
-        viable = sorted([iv for iv in self.frames_intervals
-                        if len(frame_infos) >= 1 + (self.frame_per_sample - 1) * iv])
-        if not viable:
-            raise ValueError("Not enough frames for any requested interval.")
-        frame_interval = random.choice(viable)
+            max_start = len(frame_infos) - 1 - (self.frame_per_sample - 1) * frame_interval
+            # start_index = random.randint(0, max_start)
+            start_index = 0
 
-        max_start = len(frame_infos) - 1 - (self.frame_per_sample - 1) * frame_interval
-        # start_index = random.randint(0, max_start)
-        start_index = 0
-
-        # indices actually used
-        idxs = [start_index + i * frame_interval for i in range(self.frame_per_sample)]
+            # indices actually used
+            idxs = [start_index + i * frame_interval for i in range(self.frame_per_sample)]
+        
         selected_infos = [frame_infos[i] for i in idxs]
         idxs = set(idxs)
 

@@ -36,6 +36,8 @@ def create_transport(
         model_type = ModelType.NOISE
     elif prediction == "score":
         model_type = ModelType.SCORE
+    elif prediction == "velocity_flexidit":
+        model_type = ModelType.VELOCITY_FLEXIDIT
     else:
         model_type = ModelType.VELOCITY
 

@@ -9,6 +9,7 @@ from . import path
 from .integrators import ode, sde
 from .utils import mean_flat
 from voyager.constants import PRECISION_TO_TYPE
+from voyager.modules.lora_layers import toggle_lora
 
 __all__ = ["ModelType", "PathType", "WeightType",
            "Transport", "Sampler", "SNRType"]
@@ -22,6 +23,7 @@ class ModelType(enum.Enum):
     NOISE = enum.auto()  # the model predicts epsilon
     SCORE = enum.auto()  # the model predicts \nabla \log p(x)
     VELOCITY = enum.auto()  # the model predicts v(x)
+    VELOCITY_FLEXIDIT = enum.auto() # the model predicts v(x), compared with strong model instead of ground truth
 
 
 class PathType(enum.Enum):
@@ -129,7 +131,7 @@ class Transport:
 
         return t0, t1
 
-    def sample(self, x1, n_tokens=None):
+    def sample(self, x1, n_tokens=None, t_range=None):
         """Sampling x0 & t based on shape of x1 (if needed)
         Args:
           x1 - data point; [batch, *dim]
@@ -138,7 +140,11 @@ class Transport:
             x0 = [th.randn_like(img_start) for img_start in x1]
         else:
             x0 = th.randn_like(x1)
-        t0, t1 = self.check_interval(self.train_eps, self.sample_eps)
+        if t_range is not None:
+            t0, t1 = t_range
+        else:
+            t0, t1 = self.check_interval(self.train_eps, self.sample_eps)
+        print(f"Sampling t from range [{t0}, {t1}] with snr type {self.snr_type}")
 
         if self.snr_type == SNRType.UNIFORM:
             t = th.rand((len(x1),)) * (t1 - t0) + t0
@@ -166,13 +172,13 @@ class Transport:
             return t * self.training_timesteps
 
     def training_losses(self, model, x1, model_kwargs=None, timestep=None, n_tokens=None,
-                        i2v_mode=False, cond_latents=None, args=None, partial_cond=None, partial_mask=None):
+                        i2v_mode=False, cond_latents=None, args=None, partial_cond=None, partial_mask=None, t_range=None):
 
         self.shift = self.video_shift
         if model_kwargs == None:
             model_kwargs = {}
 
-        t, x0, x1 = self.sample(x1, n_tokens)
+        t, x0, x1 = self.sample(x1, n_tokens, t_range=t_range)
         if timestep is not None:
             t = th.ones_like(t) * timestep
         t, xt, ut = self.path_sampler.plan(t, x0, x1)
@@ -209,11 +215,26 @@ class Transport:
         if partial_cond is not None and partial_mask is not None:
             xt = th.concat([xt, partial_cond, partial_mask], dim=1) 
         model_output = model(xt, input_t, **model_kwargs)['x']
+        if self.model_type == ModelType.VELOCITY_FLEXIDIT:
+            print("Using strong model for velocity flexidit loss")
+            with th.no_grad():
+                strong_model_kwargs = copy.deepcopy(model_kwargs)
+                strong_model_kwargs['use_default_only'] = True 
+                if "freqs_cos_full" in strong_model_kwargs and "freqs_sin_full" in strong_model_kwargs:
+                    strong_model_kwargs["freqs_cos"] = strong_model_kwargs["freqs_cos_full"]
+                    strong_model_kwargs["freqs_sin"] = strong_model_kwargs["freqs_sin_full"]
+                toggle_lora(model, False)
+                strong_model_output = model(xt, input_t, **strong_model_kwargs)['x']
+                toggle_lora(model, True)
+        else:
+            strong_model_output = None
 
         if i2v_mode and args.i2v_condition_type == "token_replace":
             assert self.model_type == ModelType.VELOCITY, \
                 f"self.model_type: {self.model_type} must be ModelType.VELOCITY"
             model_output = model_output[:, :, 1:, :, :]
+            if strong_model_output is not None:
+                strong_model_output = strong_model_output[:, :, 1:, :, :]
             ut = ut[:, :, 1:, :, :]
 
         if not i2v_mode:
@@ -223,6 +244,8 @@ class Transport:
         terms = {}
         if self.model_type == ModelType.VELOCITY:
             terms["loss"] = mean_flat(((model_output - ut) ** 2))
+        elif self.model_type == ModelType.VELOCITY_FLEXIDIT:
+            terms["loss"] = mean_flat(((model_output - strong_model_output) ** 2)) 
         else:
             _, drift_var = self.path_sampler.compute_drift(xt, t)
             sigma_t, _ = self.path_sampler.compute_sigma_t(

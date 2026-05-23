@@ -13,6 +13,7 @@ from torchvision.transforms import ToPILImage
 import trimesh
 import torch
 from loguru import logger
+import time
 
 def parse_arg():
     import argparse
@@ -23,6 +24,8 @@ def parse_arg():
     parser.add_argument('--width', type=int, default=360, help='Width of images to load')
     parser.add_argument('--height', type=int, default=384, help='Height of images to load')
     parser.add_argument('--use-ground-truth', action='store_true', help='Whether to use ground truth rgb and depth or partial')
+    parser.add_argument('--cameras-name', type=str, default='cameras', help='Name of the cameras folder in the dataset root')
+    parser.add_argument('--use-fixed-start-end', action='store_true', help='Whether to use fixed start and end indices for frames')
     args = parser.parse_args()
     return args
 
@@ -79,8 +82,11 @@ if __name__ == "__main__":
     dataset_root = args.dataset_root
     output_root = args.output_root
     os.makedirs(output_root, exist_ok=True)
-    dataset = RealEstate10K(dataset_root, set_name=args.split, width=args.width, height=args.height, return_inverse_depth=True)
+    dataset = RealEstate10K(dataset_root, set_name=args.split, width=args.width, height=args.height, return_inverse_depth=True, cameras_name=args.cameras_name, fixed_start_end=(None, None) if args.use_fixed_start_end else None)
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=16)
+    start_time = time.time()
+    total_render_time = 0.0
+    total_render_count = 0
 
     for batch_idx, data in tqdm(enumerate(dataloader), desc="Iterating over dataset"):
         rgbs = data['rgb'][0]  # (3, T, H, W)
@@ -91,6 +97,14 @@ if __name__ == "__main__":
 
         test_folder = os.path.join(output_root, sample_id)
         os.makedirs(test_folder, exist_ok=True)
+
+        input_folder = os.path.join(test_folder, 'input')
+        os.makedirs(input_folder, exist_ok=True)
+        input_video_path = os.path.join(input_folder, 'video.mp4')
+        depth_video_path = os.path.join(input_folder, 'depth_video.mp4')
+        if os.path.exists(input_video_path) and os.path.exists(depth_video_path):
+            print(f"Sample {sample_id} already processed, skipping.")
+            continue
 
         _, T, H, W = rgbs.shape
 
@@ -109,8 +123,6 @@ if __name__ == "__main__":
         tensor_to_mp4(rgbs, gt_video_path, fps=10)
 
         # Create partial RGB and depth as input
-        input_folder = os.path.join(test_folder, 'input')
-        os.makedirs(input_folder, exist_ok=True)
         input_rgb_folder = os.path.join(input_folder, 'rgb')
         os.makedirs(input_rgb_folder, exist_ok=True)
         input_depth_folder = os.path.join(input_folder, 'depth')
@@ -137,10 +149,14 @@ if __name__ == "__main__":
                 camera=Camera(intrinsics[i].numpy(), w2cs[i].numpy()),
                 is_reverse_depth=True,
             )
+            start_render_time = time.time()
             if (args.use_ground_truth):
-                rendered_image, mask, depth_buffer = frame.render(frame.camera)
+                rendered_image, mask, depth_buffer = frame.render_numba(frame.camera)
             else:
-                rendered_image, mask, depth_buffer = first_frame.render(frame.camera)
+                rendered_image, mask, depth_buffer = first_frame.render_numba(frame.camera)
+            render_time = time.time() - start_render_time
+            total_render_time += render_time
+            total_render_count += 1
             rendered_image, mask, depth_buffer = norm_partial_render_output(
                 rendered_image, mask, depth_buffer
             )
@@ -163,10 +179,14 @@ if __name__ == "__main__":
         total_rendered_image_tensor = torch.stack(total_rendered_image_tensor, dim=1)  # (3, H, W)
         total_depth_tensor = torch.stack(total_depth_tensor, dim=1)  # (3, T, H, W)
         
-        input_video_path = os.path.join(input_folder, 'video.mp4')
         print(f'Saving input video to {input_video_path}')
         tensor_to_mp4(total_rendered_image_tensor, input_video_path, fps=10)
-
-        depth_video_path = os.path.join(input_folder, 'depth_video.mp4')
+        
         print(f'Saving depth video to {depth_video_path}')
         tensor_to_mp4(total_depth_tensor, depth_video_path, fps=10)
+        print(f"Average render time per frame: {total_render_time / total_render_count:.4f} seconds.")
+        print(f"Current average process time per sample: {(time.time() - start_time) / (batch_idx + 1):.2f} seconds.")
+    
+    elapsed_time = time.time() - start_time
+    print(f"Finished processing {len(dataloader)} samples in {elapsed_time:.2f} seconds, average {elapsed_time / len(dataloader):.2f} seconds per sample.")
+    

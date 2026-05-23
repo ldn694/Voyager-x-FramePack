@@ -31,6 +31,7 @@ class LoRALinear(nn.Linear):
         self.r = r
         self.lora_alpha = lora_alpha
         self.lora_dropout = nn.Dropout(lora_dropout) if lora_dropout > 0 else nn.Identity()
+        self.lora_enabled = True
 
         if r > 0:
             # A: r x in, B: out x r
@@ -85,7 +86,7 @@ class LoRALinear(nn.Linear):
         result = nn.functional.linear(x, self.weight, self.bias)
 
         # LoRA update
-        if self.r > 0 and self.lora_A is not None and self.lora_B is not None:
+        if self.lora_enabled and self.r > 0 and self.lora_A is not None and self.lora_B is not None:
             # x @ A^T => (..., r)
             lora_in = self.lora_dropout(x)
             lora_update = (lora_in @ self.lora_A.t()) @ self.lora_B.t()
@@ -93,6 +94,20 @@ class LoRALinear(nn.Linear):
 
         return result
 
+def toggle_lora(model: nn.Module, enable: bool = True) -> None:
+    """
+    Enable or disable LoRA computation across the entire model.
+    
+    Args:
+        model: The model containing LoRALinear layers.
+        enable: True to turn LoRA on, False to turn it off.
+    """
+    toggled_count = 0
+    for module in model.modules():
+        if isinstance(module, LoRALinear):
+            module.lora_enabled = enable
+            toggled_count += 1
+    print(f"Toggled LoRA {'ON' if enable else 'OFF'} for {toggled_count} layers.")
 
 def _replace_linear_with_lora(
     module: nn.Module,

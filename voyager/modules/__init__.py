@@ -1,5 +1,6 @@
 from .models import HYVideoDiffusionTransformer, HUNYUAN_VIDEO_CONFIG
 from .sampler_scheduler import SamplerScheduler
+from .lora_layers import toggle_lora
 
 
 def load_model(args, in_channels, out_channels, factor_kwargs):

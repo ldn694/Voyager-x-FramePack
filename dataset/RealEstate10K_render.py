@@ -32,7 +32,8 @@ class RealEstate10K_render(Dataset):
                  height=None,
                  return_inverse_depth=False,
                  return_gt_render=False,
-                 return_partial_render=False
+                 return_partial_render=False,
+                 gt_conditioning=False
                  ):
         '''
         Args:
@@ -50,6 +51,7 @@ class RealEstate10K_render(Dataset):
         self.return_inverse_depth = return_inverse_depth
         self.return_gt_render = return_gt_render
         self.return_partial_render = return_partial_render
+        self.gt_conditioning = gt_conditioning
 
         self.frame_path = os.path.join(self.root_path, 'transcode')
         self.depth_path = os.path.join(self.root_path, 'depth_videos')
@@ -338,7 +340,10 @@ class RealEstate10K_render(Dataset):
             ground_truth_rgb_depths, _ = self._render_sample(frames, (3, self.frame_per_sample, self.height, self.width), partial=False)
             result['gt_render'] = ground_truth_rgb_depths
         if self.return_partial_render:
-            partial_rgb_depths, partial_mask = self._render_sample(frames, (3, self.frame_per_sample, self.height, self.width), partial=True)
+            if self.gt_conditioning:
+                partial_rgb_depths, partial_mask = self._render_sample(frames, (3, self.frame_per_sample, self.height, self.width), partial=False)
+            else:
+                partial_rgb_depths, partial_mask = self._render_sample(frames, (3, self.frame_per_sample, self.height, self.width), partial=True)
             result['partial_render'] = partial_rgb_depths
             result['partial_mask'] = partial_mask
         
@@ -359,9 +364,9 @@ class RealEstate10K_render(Dataset):
         first_frame = frames[0]
         for frame in frames:
             if not partial:
-                rendered_image, mask, depth_buffer = frame.render(frame.camera)
+                rendered_image, mask, depth_buffer = frame.render_numba(frame.camera)
             else:
-                rendered_image, mask, depth_buffer = first_frame.render(frame.camera)
+                rendered_image, mask, depth_buffer = first_frame.render_numba(frame.camera)
             
             rendered_image, mask, depth_buffer = norm_partial_render_output(
                 rendered_image, mask, depth_buffer

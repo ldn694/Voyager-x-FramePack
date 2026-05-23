@@ -224,18 +224,27 @@ def set_reproducibility(enable, global_seed=None):
 
     # LSTM and RNN networks are not deterministic
 
-def build_rope(latents, args, model, rope_theta_rescale_factor=1.0, rope_interpolation_factor=1.0):
+def build_rope(latents, args, model, rope_theta_rescale_factor=1.0, rope_interpolation_factor=1.0, use_old_patch_size=False):
     # ======================================== Build RoPE ======================================
     target_ndim = 3  # n-d RoPE
     ndim = len(latents.shape) - 2
     latents_size = list(latents.shape[-ndim:])
     if args.train_multiple_kernels:
-        scheduler = CompressionScheduler(
-            schedule_config={
-                "patch_sizes": args.kernel_sizes if args.kernel_sizes is not None else model.patch_size,
-            }
-        )
-        indices = args.kernel_indices if args.kernel_indices is not None else [range(latents_size[0])]
+        if use_old_patch_size:
+            scheduler = CompressionScheduler(
+                schedule_config={
+                    "patch_sizes": [args.kernel_sizes[0]]
+                }
+            )
+            indices = [list(range(latents_size[0]))] # Use all indices for old patch size
+        else:
+            scheduler = CompressionScheduler(
+                schedule_config={
+                    "patch_sizes": args.kernel_sizes if args.kernel_sizes is not None else model.patch_size,
+                }
+            )
+            indices = args.kernel_indices if args.kernel_indices is not None else [list(range(latents_size[0]))]
+
         freqs_cos, freqs_sin = scheduler.get_rope_freq(
             indices,
             args.rope_theta,
@@ -256,6 +265,7 @@ def build_rope(latents, args, model, rope_theta_rescale_factor=1.0, rope_interpo
             target_ndim,
             rope_theta_rescale_factor=rope_theta_rescale_factor,
             rope_interpolation_factor=rope_interpolation_factor,
+            use_old_patch_size=use_old_patch_size,
         )
     return freqs_cos, freqs_sin
 
@@ -375,6 +385,14 @@ def prepare_model_inputs(
         rope_theta_rescale_factor=rope_theta_rescale_factor,
         rope_interpolation_factor=rope_interpolation_factor,
     )
+    freqs_cos_full, freqs_sin_full = build_rope(
+        latents,
+        args,
+        model,
+        rope_theta_rescale_factor=rope_theta_rescale_factor,
+        rope_interpolation_factor=rope_interpolation_factor,
+        use_old_patch_size=True,
+    )
 
     # ===================================== Pack model kwargs ==================================
     model_kwargs = dict(
@@ -383,6 +401,8 @@ def prepare_model_inputs(
         text_states_2=text_states_2.to(dtype=model.dtype) if text_states_2 is not None else None,  # [b, 768]
         freqs_cos=freqs_cos,  # [seqlen, head_dim]
         freqs_sin=freqs_sin,  # [seqlen, head_dim]
+        freqs_cos_full=freqs_cos_full,  # [seqlen, head_dim]
+        freqs_sin_full=freqs_sin_full,  # [seqlen, head_dim]
         return_dict=True,
         indices = args.kernel_indices if args.train_multiple_kernels else None,
     )
@@ -418,24 +438,30 @@ def get_rope_freq_from_size(
     target_ndim,
     rope_theta_rescale_factor=1.0,
     rope_interpolation_factor=1.0,
+    use_old_patch_size=False,
 ):
 
-    if isinstance(model.patch_size, int):
-        assert all(s % model.patch_size == 0 for s in latents_size), (
-            f"Latent size(last {ndim} dimensions) should be divisible by patch size({model.patch_size}), "
+    if hasattr(model, "old_patch_size") and use_old_patch_size:
+        ps = model.old_patch_size
+    else:
+        ps = model.patch_size
+    print(f"Using patch size {ps} for RoPE calculation. Use old patch size is {use_old_patch_size}.")
+    if isinstance(ps, int):
+        assert all(s % ps == 0 for s in latents_size), (
+            f"Latent size(last {ndim} dimensions) should be divisible by patch size({ps}), "
             f"but got {latents_size}."
         )
-        rope_sizes = [s // model.patch_size for s in latents_size]
-
-    elif isinstance(model.patch_size, list):
+        rope_sizes = [s // ps for s in latents_size]
+    elif isinstance(ps, list):
         assert all(
-            s % model.patch_size[idx] == 0 for idx, s in enumerate(latents_size)
+            s % ps[idx] == 0
+            for idx, s in enumerate(latents_size)
         ), (
-            f"Latent size(last {ndim} dimensions) should be divisible by patch size({model.patch_size}), "
+            f"Latent size(last {ndim} dimensions) should be divisible by patch size({ps}), "
             f"but got {latents_size}."
         )
-        rope_sizes = [s // model.patch_size[idx]
-                      for idx, s in enumerate(latents_size)]
+        rope_sizes = [s // ps[idx]
+                    for idx, s in enumerate(latents_size)]
 
     if len(rope_sizes) != target_ndim:
         rope_sizes = [1] * (target_ndim - len(rope_sizes)

@@ -72,7 +72,6 @@ if __name__ == "__main__":
         if os.path.exists(os.path.join(save_path, f'{test_path}.json')):
             print(f"Metrics already exist for {test_path}, skipping...")
             continue
-
         outputs = hunyuan_video_sampler.predict(
             prompt=args.prompt,
             height=args.video_size[0],

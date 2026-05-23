@@ -27,7 +27,7 @@ from voyager.utils.train_utils import set_reproducibility, prepare_model_inputs,
 from voyager.utils.file_utils import save_videos_grid
 from voyager.inference import load_models
 from voyager.modules.lora_layers import apply_lora_to_hunyuan_video, get_lora_parameters, get_lora_state_dict, load_lora_state_dict
-from voyager.modules.custom_patch_embed import apply_patch_adapter_to_hunyuan_video, get_patch_adapter_parameters, get_patch_adapter_state_dict
+from voyager.modules.custom_patch_embed import apply_patch_adapter_to_hunyuan_video, get_patch_adapter_parameters, get_patch_adapter_state_dict, load_patch_adapter_state_dict
 from voyager.modules.multi_kernel import apply_multikernel_to_hunyuan_video, get_multikernel_parameters, get_multikernel_state_dict, load_multikernel_state_dict
 from voyager.modules.double_branch import apply_double_branch_to_hunyuan_video, get_double_branch_parameters, get_double_branch_state_dict, load_double_branch_state_dict, TransformerBranchConfig
 from voyager.modules.models import HUNYUAN_VIDEO_CONFIG
@@ -108,10 +108,22 @@ def parse_arg():
         help='Path to a double-branch checkpoint (.pt) to resume from',
     )
     parser.add_argument(
+        '--resume-patch-adapter',
+        type=str,
+        default=None,
+        help='Path to a patch adapter checkpoint (.pt) to resume from'
+    )
+    parser.add_argument(
         '--save-every',
         type=int,
         default=1000,
         help='Save checkpoint every N effective steps (after grad accumulation).',
+    )
+    parser.add_argument(
+        '--backup-every',
+        type=int,
+        default=2000,
+        help='Backup checkpoint every N effective steps (after grad accumulation).'
     )
     parser.add_argument(
         "--patch_adapter_size",
@@ -180,6 +192,7 @@ def parse_arg():
         assert isinstance(HUNYUAN_VIDEO_CONFIG[args.model_with_double_branch]["second_branch_transformer_config"], TransformerBranchConfig), f"Model {args.model_with_double_branch} does not have valid second_branch_transformer_config."
         args.second_branch_transformer_config = HUNYUAN_VIDEO_CONFIG[args.model_with_double_branch]["second_branch_transformer_config"]
         args.second_branch_mm_blocks_depth = HUNYUAN_VIDEO_CONFIG[args.model_with_double_branch]["second_branch_mm_blocks_depth"]
+        logger.info(f"Using double branch model {args.model_with_double_branch} with double branch config {args.second_branch_transformer_config}")
     return args
 
 def training_step(
@@ -218,6 +231,7 @@ def training_step(
             args=args,
             partial_cond=partial_cond,
             partial_mask=partial_mask,
+            t_range=args.sample_time_range if hasattr(args, "sample_time_range") else None,
         )
     
 
@@ -494,7 +508,8 @@ if __name__ == "__main__":
     #===================DATASET & DATALOADER===================#
 
     dataset_root = args.dataset_root
-    dataset = RealEstate10K(dataset_root, set_name=args.task_flag, width=args.width, height=args.height, return_inverse_depth=True)
+    dataset = RealEstate10K(dataset_root, set_name=args.task_flag, width=args.width, height=args.height, return_inverse_depth=True, gt_conditioning=args.use_gt_as_cond)
+    logger.warning(f"USING GT AS CONDITION: {args.use_gt_as_cond}")
     sampler = DistributedSampler(
         dataset,
         num_replicas=dist.get_world_size(),
@@ -546,7 +561,7 @@ if __name__ == "__main__":
             freeze_base=not args.train_from_scratch
         )
     if args.patch_adapter_size is not None:
-        logger.info(f"Applying Patch Size Adapters with new patch size: {args.patch_adapter_size}")
+        logger.warning(f"Applying Patch Size Adapters with new patch size: {args.patch_adapter_size}")
         apply_patch_adapter_to_hunyuan_video(
             model,
             new_patch_size=tuple(args.patch_adapter_size),
@@ -655,6 +670,15 @@ if __name__ == "__main__":
         load_double_branch_state_dict(model, ckpt["double_branch"], strict=False)
 
         logger.info("Resumed Double Branch checkpoint.")
+
+    if args.resume_patch_adapter is not None and os.path.isfile(args.resume_patch_adapter):
+        logger.info(f"Resuming Patch Adapter from {args.resume_patch_adapter}")
+        ckpt = torch.load(args.resume_patch_adapter, map_location='cpu', weights_only=False)
+
+        # Load double-branch weights into the wrapped model
+        load_patch_adapter_state_dict(model, ckpt["patch_adapter"], strict=False)
+
+        logger.info("Resumed Patch Adapter checkpoint.")
     
     if args.resume is not None and os.path.isfile(args.resume):
         logger.info(f"Resuming full model from {args.resume}")
@@ -898,6 +922,10 @@ if __name__ == "__main__":
             
             if is_update_step and args.save_every > 0 and (effective_update % args.save_every == 0):
                 save_ckpt(args, model_engine, epoch, step, training_output_dir, total_skip)
+            if is_update_step and args.backup_every > 0 and (effective_update % args.backup_every == 0):
+                backup_path = os.path.join(training_output_dir, "backup", f"Step-{effective_update:05d}")
+                os.makedirs(backup_path, exist_ok=True)
+                save_ckpt(args, model_engine, epoch, step, backup_path, total_skip)
 
             if args.early_stop_training_loss is not None:
                 # 1. Create a tensor for the current local loss

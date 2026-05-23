@@ -46,7 +46,7 @@ from diffusers.utils import BaseOutput
 from ...constants import PRECISION_TO_TYPE
 from ...vae.autoencoder_kl_causal_3d import AutoencoderKLCausal3D
 from ...text_encoder import TextEncoder
-from ...modules import HYVideoDiffusionTransformer, SamplerScheduler
+from ...modules import HYVideoDiffusionTransformer, SamplerScheduler, toggle_lora
 from ...utils.data_utils import black_image
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -751,6 +751,8 @@ Please use VaeImageProcessor.postprocess(...) instead"
         partial_mask=None,
         use_kernel_indices: Optional[List[int]] = None,
         freqs_cis_full: Tuple[torch.Tensor, torch.Tensor] = None,
+        step_sample: int = 0,
+        attn_map: int = 0,
         **kwargs,
     ):
         r"""
@@ -1050,6 +1052,8 @@ Please use VaeImageProcessor.postprocess(...) instead"
             num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
 
+        intermediate_samples = []  # <--- multiple samples saving
+
         sampler_scheduler = SamplerScheduler(
             num_steps=num_inference_steps,
             modes=["custom", "default"]
@@ -1111,7 +1115,15 @@ Please use VaeImageProcessor.postprocess(...) instead"
                     device_type="cuda", dtype=target_dtype, enabled=autocast_enabled
                 ):
                     cur_mode = mode_schedule[i]
+
+
+                    if attn_map > 0:
+                        for layer_idx, block in enumerate(self.transformer.single_blocks):
+                            # Dynamically inject: (layer_index, current_denoising_step, stride)
+                            block.step_cfg = (layer_idx, i, attn_map)
+
                     if cur_mode == "custom":
+                        toggle_lora(self.transformer, enable=True)
                         noise_pred = self.transformer(  # For an input image (129, 192, 336) (1, 256, 256)
                             latent_model_input,  # [2, 16, 33, 24, 42]
                             t_expand,  # [2]
@@ -1130,6 +1142,7 @@ Please use VaeImageProcessor.postprocess(...) instead"
                             "x"
                         ]
                     elif cur_mode == "default":
+                        toggle_lora(self.transformer, enable=False)
                         noise_pred = self.transformer(  # For an input image (129, 192, 336) (1, 256, 256)
                             latent_model_input,  # [2, 16, 33, 24, 42]
                             t_expand,  # [2]
@@ -1215,6 +1228,56 @@ Please use VaeImageProcessor.postprocess(...) instead"
                         step_idx = i // getattr(self.scheduler, "order", 1)
                         callback(step_idx, t, latents)
 
+
+                # ==========================================================
+                current_step = i
+                if step_sample > 0 and (((current_step + 1) % step_sample == 0) or current_step == 0):
+                    if logger is not None:
+                        logger.info(f"Decoding intermediate latents at step {current_step}...")
+                    
+                    with torch.no_grad():
+                        step_latents = latents.clone()
+                        
+                        # Handle temporal dim
+                        step_expand_temporal = False
+                        if len(step_latents.shape) == 4 and isinstance(self.vae, AutoencoderKLCausal3D):
+                            step_latents = step_latents.unsqueeze(2)
+                            step_expand_temporal = True
+                        
+                        # Apply shift & scaling
+                        if hasattr(self.vae.config, "shift_factor") and self.vae.config.shift_factor:
+                            step_latents = (step_latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+                        else:
+                            step_latents = step_latents / self.vae.config.scaling_factor
+                            
+                        # Decode
+                        with torch.autocast(device_type="cuda", dtype=vae_dtype, enabled=vae_autocast_enabled):
+                            if enable_tiling:
+                                self.vae.enable_tiling()
+                            step_image = self.vae.decode(step_latents, return_dict=False, generator=generator)[0]
+                            
+                        # Post-process
+                        if step_expand_temporal or step_image.shape[2] == 1:
+                            step_image = step_image.squeeze(2)
+                            
+                        step_image = (step_image / 2 + 0.5).clamp(0, 1).cpu().float()
+                        
+                        # RGB and Depth Split (Matching final output logic)
+                        step_half_height = (height - 64) // 2
+                        step_rgb = step_image[..., :step_half_height, :]
+                        step_depth = step_image[..., -step_half_height:, :]
+                        step_depth = step_depth[:, 0] * 0.299 + step_depth[:, 1] * 0.587 + step_depth[:, 2] * 0.114
+                        step_depth = step_depth.unsqueeze(1).repeat(1, 3, 1, 1, 1)
+                        if len(step_rgb.shape) == 4:
+                            step_rgb = step_rgb.unsqueeze(2)
+                        
+                        step_image_final = torch.cat([step_rgb, step_depth], dim=-2)
+                        intermediate_samples.append((current_step, step_image_final))
+                        
+                        # Clear VRAM cache to prevent OOM
+                        torch.cuda.empty_cache()
+                # ==========================================================
+
         if not output_type == "latent":
             expand_temporal_dim = False
             if len(latents.shape) == 4:
@@ -1288,12 +1351,21 @@ Please use VaeImageProcessor.postprocess(...) instead"
         depth = image[..., -half_height:, :]
         depth = depth[:, 0] * 0.299 + depth[:, 1] * 0.587 + depth[:, 2] * 0.114
         depth = depth.unsqueeze(1).repeat(1, 3, 1, 1, 1)
+        if len(rgb.shape) == 4:
+            rgb = rgb.unsqueeze(2)
         image = torch.cat([rgb, depth], dim=-2)
 
         # Offload all models
         self.maybe_free_model_hooks()
 
-        if not return_dict:
-            return image
+        # Package the output to match your extraction logic
+        if step_sample > 0:
+            output_data = (image, intermediate_samples)
+        else:
+            output_data = image
 
-        return HunyuanVideoPipelineOutput(videos=image)
+        if not return_dict:
+            return (output_data,)
+
+        # By passing it to 'videos', calling self.pipeline(...)[0] will return output_data
+        return HunyuanVideoPipelineOutput(videos=output_data)

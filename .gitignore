@@ -1,3 +1,12 @@
 # Ignore Python bytecode files
 __pycache__/
 *.pyc
+*results*/
+*output*/
+ckpts/
+data_engine/
+data_engine/*.py
+data_engine/Metric3D
+data_engine/MoGe
+data_engine/vggt
+images*/

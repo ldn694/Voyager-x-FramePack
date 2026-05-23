@@ -4,6 +4,32 @@ import cv2
 import trimesh
 import torch
 import imageio.v2 as imageio  # pip install imageio[ffmpeg]
+import numba
+
+@numba.njit(parallel=False)
+def numba_render_kernel(rows, cols, depths, rgbs, width, height):
+    # Initialize buffers
+    rendered_image = np.zeros((height, width, 3), dtype=np.uint8)
+    depth_buffer = np.full((height, width), 1e8, dtype=np.float32)
+    mask = np.zeros((height, width), dtype=np.uint8)
+
+    for i in range(len(depths)):
+        r, c = rows[i], cols[i]
+        d = depths[i]
+        
+        # Check bounds (safety)
+        if r < 0 or r >= height or c < 0 or c >= width:
+            continue
+            
+        # Z-buffer check: only draw if point is closer than what's already there
+        if 0 < d < depth_buffer[r, c]:
+            depth_buffer[r, c] = d
+            rendered_image[r, c, 0] = rgbs[i, 0]
+            rendered_image[r, c, 1] = rgbs[i, 1]
+            rendered_image[r, c, 2] = rgbs[i, 2]
+            mask[r, c] = 255
+            
+    return rendered_image, mask, depth_buffer
 
 class Camera:
     @staticmethod
@@ -54,16 +80,28 @@ class Camera:
         points_3d_homogeneous = np.hstack((points_3d, np.ones((num_points, 1))))
         points_3d_camera = (w2c @ points_3d_homogeneous.T).T
         points_2d_homogeneous = (K_tensor @ points_3d_camera[:, :3].T).T
-        points_2d = points_2d_homogeneous[:, :2] / points_2d_homogeneous[:, 2:3]
+        # To avoid division by zero, we can add a small epsilon to the depth values or filter out points with very small depth before division.
+        valid_depth_mask = np.abs(points_2d_homogeneous[:, 2:3]) > 1e-6
+        z_safe = np.where(valid_depth_mask, points_2d_homogeneous[:, 2:3], 1e-6) 
+        points_2d = points_2d_homogeneous[:, :2] / z_safe
+        # points_2d = points_2d_homogeneous[:, :2] / points_2d_homogeneous[:, 2:3]
         z = points_3d_camera[:, 2] # not actual depth, but depth in camera coordinates
-        if np.any(np.isnan(points_2d)) and np.any(np.isinf(points_2d)):
-            raise ValueError("NaN and Infs in projection!")
-        elif np.any(np.isnan(points_2d)):
-            raise ValueError("NaN in projection!")
-        elif np.any(np.isinf(points_2d)):
-            raise ValueError("Infs in projection!")
+        # Create a mask of valid rows (where both x and y are finite: not NaN, not Inf)
+        valid_mask = np.all(np.isfinite(points_2d), axis=1)
         
-        return points_2d, z
+        # Filter both the 2D points and the Z values using the mask
+        points_2d_clean = points_2d[valid_mask]
+        z_clean = z[valid_mask]
+        
+        return points_2d_clean, z_clean
+        # if np.any(np.isnan(points_2d)) and np.any(np.isinf(points_2d)):
+        #     raise ValueError("NaN and Infs in projection!")
+        # elif np.any(np.isnan(points_2d)):
+        #     raise ValueError("NaN in projection!")
+        # elif np.any(np.isinf(points_2d)):
+        #     raise ValueError("Infs in projection!")
+        
+        # return points_2d, z
 
 class Frame:
     def __init__(self, rgb: Image.Image, 
@@ -158,6 +196,36 @@ class Frame:
         mask = np.zeros_like(depth_buffer, dtype=np.uint8)
         mask[depth_buffer != np.inf] = 255
         return rendered_image, mask, depth_buffer
+    
+    def render_numba(self, camera):
+        points_3d = self.get_point_cloud()
+        rgb_values = np.array(self.rgb).reshape(-1, 3)
+        projected_2d, depth = camera.project_3d_to_2d(points_3d)
+        width, height = self.rgb.size
+
+        # 1. Basic filtering (keep points in front of camera)
+        pixel_coords = np.round(projected_2d).astype(np.int32)
+        cols = pixel_coords[:, 0]
+        rows = pixel_coords[:, 1]
+        
+        # 2. Filter valid indices to reduce work for the kernel
+        valid = (cols >= 0) & (cols < width) & (rows >= 0) & (rows < height) & (depth > 0)
+        
+        # 3. Call the fast Numba kernel
+        # No more np.argsort or np.unique!
+        img, mask, d_buf = numba_render_kernel(
+            rows[valid], 
+            cols[valid], 
+            depth[valid].astype(np.float32), 
+            rgb_values[valid], 
+            width, 
+            height
+        )
+        
+        # Replace 1e8 with inf for consistency with your original code
+        d_buf[d_buf == 1e8] = np.inf
+        
+        return img, mask, d_buf
 
 def tensor_to_mp4(tensor: torch.Tensor, out_path: str, fps: int = 25) -> None:
     """

@@ -1,6 +1,8 @@
 from typing import Any, List, Tuple, Optional, Union, Dict
 from einops import rearrange
 from loguru import logger
+import os
+import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
@@ -40,7 +42,7 @@ class MMDoubleStreamBlock(nn.Module):
         qk_norm_type: str = "rms",
         qkv_bias: bool = False,
         dtype: Optional[torch.dtype] = None,
-        device: Optional[torch.device] = None,
+        device: Optional[torch.device] = None
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -325,6 +327,7 @@ class MMSingleStreamBlock(nn.Module):
         qk_scale: float = None,
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
+        step_cfg: Optional[Tuple] = None
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -372,6 +375,7 @@ class MMSingleStreamBlock(nn.Module):
             **factory_kwargs,
         )
         self.hybrid_seq_parallel_attn = None
+        self.step_cfg = step_cfg
 
     def enable_deterministic(self):
         self.deterministic = True
@@ -437,6 +441,95 @@ class MMSingleStreamBlock(nn.Module):
                 img_qq.shape == img_q.shape and img_kk.shape == img_k.shape
             ), f"img_kk: {img_qq.shape}, img_q: {img_q.shape}, img_kk: {img_kk.shape}, img_k: {img_k.shape}"
             img_q, img_k = img_qq, img_kk
+            
+
+            # =================================================================
+            # Compute image to image attention map (MEMORY EFFICIENT & FRAME-WISE):
+            if hasattr(self, 'step_cfg') and self.step_cfg is not None:
+                import matplotlib.pyplot as plt
+                import os
+                
+                # Properly unpack the tuple from step_cfg
+                layer_idx, current_step, stride = self.step_cfg
+                
+                # Only execute visualization on specific strides
+                if layer_idx % stride == 0:
+                    # Transpose Q and K to [Batch, Heads, L_img, HeadDim]
+                    q_img_trans = img_q.transpose(1, 2)
+                    k_img_trans = img_k.transpose(1, 2)
+                    
+                    B, Heads, L_img, HeadDim = q_img_trans.shape
+                    
+                    num_frames = 13
+                    tokens_per_frame = L_img // num_frames  # Should calculate to 3264
+                    chunk_size = 1024 
+                    
+                    # Allocate accumulator
+                    frame_attn_accum = torch.zeros(
+                        (B, Heads, L_img, num_frames), 
+                        device=q_img_trans.device, 
+                        dtype=q_img_trans.dtype
+                    )
+                    
+                    # Ensure scaling factor exists (default is 1 / sqrt(dim))
+                    scale = self.scale if hasattr(self, 'scale') else (1.0 / (HeadDim ** 0.5))
+                    
+                    for i in range(0, L_img, chunk_size):
+                        end_i = min(i + chunk_size, L_img)
+                        chunk_len = end_i - i
+                        q_chunk = q_img_trans[:, :, i:end_i, :]  
+                        
+                        # Calculate scores and weights for the chunk
+                        scores_chunk = torch.matmul(q_chunk, k_img_trans.transpose(-2, -1)) * scale
+                        weights_chunk = torch.softmax(scores_chunk, dim=-1)
+                        
+                        # Group Key tokens and sum
+                        weights_chunk_grouped = weights_chunk.view(B, Heads, chunk_len, num_frames, tokens_per_frame)
+                        chunk_sum_keys = weights_chunk_grouped.sum(dim=-1)  
+                        
+                        frame_attn_accum[:, :, i:end_i, :] = chunk_sum_keys
+                    
+                    # Group Query tokens and take the mean
+                    frame_attn_accum = frame_attn_accum.view(B, Heads, num_frames, tokens_per_frame, num_frames)
+                    frame_wise_attn = frame_attn_accum.mean(dim=3).mean(dim=1)
+                    
+                    # Save outputs
+                    file_basename = f"layer_{layer_idx:02d}_step_{current_step:04d}"
+                    print(f"Saving frame-wise attention map: {file_basename} | Shape: {frame_wise_attn.shape}")
+                    
+                    # Define the base directory
+                    base_dir = "/raid/hvtham/ldnhuan/HunyuanWorld-Voyager/minh_attention_ckpt_full"
+                    
+                    # Create separate subfolders for 'tensor' and 'frame' inside the layer directory
+                    save_dir_tensor = os.path.join(base_dir, f"layer_{layer_idx:02d}", "tensor")
+                    save_dir_frame = os.path.join(base_dir, f"layer_{layer_idx:02d}", "frame")
+                    
+                    # Make sure both directories exist
+                    os.makedirs(save_dir_tensor, exist_ok=True)
+                    os.makedirs(save_dir_frame, exist_ok=True)
+                    
+                    # Save the raw tensor (.pt) into the 'tensor' folder
+                    save_path_pt = os.path.join(save_dir_tensor, f"frame_wise_attn_{file_basename}.pt")
+                    torch.save(frame_wise_attn.detach().cpu(), save_path_pt)
+                    
+                    # Generate and save the heatmap (.png) into the 'frame' folder
+                    attn_numpy = frame_wise_attn[0].detach().cpu().float().numpy() 
+                    
+                    plt.figure(figsize=(8, 6))
+                    plt.imshow(attn_numpy, cmap='viridis', aspect='auto')
+                    plt.colorbar(label='Attention Probability')
+                    plt.title(f"Frame-to-Frame Transition (Layer {layer_idx}, Step {current_step})")
+                    plt.xlabel("Key Frame (Attended To)")
+                    plt.ylabel("Query Frame (Attending From)")
+                    plt.xticks(range(num_frames))
+                    plt.yticks(range(num_frames))
+                    
+                    save_path_png = os.path.join(save_dir_frame, f"heatmap_{file_basename}.png")
+                    plt.savefig(save_path_png, bbox_inches='tight', dpi=300)
+                    plt.close()
+            # =================================================================
+
+
             if txt_q is not None:
                 q = torch.cat((img_q, txt_q), dim=1)
             else:
@@ -779,6 +872,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         patch_sizes: Optional[List[List[int]]] = None,
         second_branch_mm_blocks_depth: int = 0,
         second_branch_transformer_config: Optional[TransformerBranchConfig] = None,
+        step_cfg: Optional[Tuple] = None,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -895,6 +989,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                     mlp_act_type=mlp_act_type,
                     qk_norm=qk_norm,
                     qk_norm_type=qk_norm_type,
+                    step_cfg = step_cfg,  #(layer, step_denoise, stride_to_save_attn_map)
                     **factory_kwargs,
                 )
                 for _ in range(mm_single_blocks_depth)
@@ -1080,6 +1175,8 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         return_dict: bool = True,
         indices: Optional[List[int]] = None,
         use_default_only: bool = False,
+        freqs_cos_full: Optional[torch.Tensor] = None,
+        freqs_sin_full: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         logger.debug(f"{x.shape=} {x.min()=} {x.max()=} {x.mean()=}")
         logger.debug(f"latent {x[:, :16, :, :, :].shape=} {x[:, :16, :, :, :].min()=} {x[:, :16, :, :, :].max()=} {x[:, :16, :, :, :].mean()=}")
@@ -1097,11 +1194,18 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         img = x
         txt = text_states
         _, _, ot, oh, ow = x.shape
-        tt, th, tw = (
-            ot // self.patch_size[0],
-            oh // self.patch_size[1],
-            ow // self.patch_size[2],
-        )
+        if hasattr(self, "old_patch_size") and use_default_only:
+            tt, th, tw = (
+                ot // self.old_patch_size[0],
+                oh // self.old_patch_size[1],
+                ow // self.old_patch_size[2],
+            )
+        else:
+            tt, th, tw = (
+                ot // self.patch_size[0],
+                oh // self.patch_size[1],
+                ow // self.patch_size[2],
+            )
 
         # Prepare modulation vectors.
         vec = self.time_in(t)
@@ -1474,7 +1578,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                 img = self.old_final_layer(img, vec)
             else:
                 img = self.final_layer(img, vec)
-            img = self.unpatchify(img, tt, th, tw)
+            img = self.unpatchify(img, tt, th, tw, use_default_only=use_default_only)
         else:
             img = self.final_layer(img, vec, indices=indices, patch_indices=patch_indices)
             img = self.unpatchify_multi(
@@ -1510,13 +1614,16 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
 
         return out
 
-    def unpatchify(self, x, t, h, w):
+    def unpatchify(self, x, t, h, w, use_default_only=False):
         """
         x: (N, T, patch_size**2 * C)
         imgs: (N, H, W, C)
         """
         c = self.unpatchify_channels
-        pt, ph, pw = self.patch_size
+        if use_default_only and hasattr(self, "old_patch_size"):
+            pt, ph, pw = self.old_patch_size
+        else:
+            pt, ph, pw = self.patch_size
         assert t * h * w == x.shape[1]
 
         x = x.reshape(shape=(x.shape[0], t, h, w, c, pt, ph, pw))
@@ -1725,6 +1832,59 @@ HUNYUAN_VIDEO_CONFIG = {
             heads_num=4,
             mlp_width_ratio=4,
             scheduler=[(0, 3), (-3, 11), (15, -4), (-5, 19), (-6, 23), (-9, 31), (35, -10), (-11, 39), (-12, 43), (-15, 51), (55, -16), (-17, 59)],
+        ),
+    },
+    "HYVideo-T/2-2branch-no_cross_attn": {
+        "mm_double_blocks_depth": 20,
+        "mm_single_blocks_depth": 40,
+        "rope_dim_list": [16, 56, 56],
+        "hidden_size": 3072,
+        "heads_num": 24,
+        "mlp_width_ratio": 4,
+        "second_branch_mm_blocks_depth": 18,
+        "second_branch_transformer_config": TransformerBranchConfig(
+            hidden_size=512,
+            heads_num=4,
+            mlp_width_ratio=4,
+            scheduler=[],
+        ),
+    },
+    "HYVideo-T/2-2branch-cross_attn-unidirectional-q_second": {
+        "mm_double_blocks_depth": 20,
+        "mm_single_blocks_depth": 40,
+        "rope_dim_list": [16, 56, 56],
+        "hidden_size": 3072,
+        "heads_num": 24,
+        "mlp_width_ratio": 4,
+        "second_branch_mm_blocks_depth": 18,
+        "second_branch_transformer_config": TransformerBranchConfig(
+            hidden_size=512,
+            heads_num=4,
+            mlp_width_ratio=4,
+            scheduler=[(0, 3), (-3, 11), (-5, 19), (-6, 23), (-9, 31), (-11, 39), (-12, 43), (-15, 51), (-17, 59)],
+        ),
+    },
+    "HYVideo-B/2": {
+        "mm_double_blocks_depth": 6,
+        "mm_single_blocks_depth": 12,
+        "rope_dim_list": [16, 56, 56],
+        "hidden_size": 1536,
+        "heads_num": 12,
+        "mlp_width_ratio": 4,
+    },
+    "HYVideo-T/2-2branch-cross_attn-0001": {
+        "mm_double_blocks_depth": 20,
+        "mm_single_blocks_depth": 40,
+        "rope_dim_list": [16, 56, 56],
+        "hidden_size": 3072,
+        "heads_num": 24,
+        "mlp_width_ratio": 4,
+        "second_branch_mm_blocks_depth": 18,
+        "second_branch_transformer_config": TransformerBranchConfig(
+            hidden_size=512,
+            heads_num=4,
+            mlp_width_ratio=4,
+            scheduler=[(0, 3), (7, -1), (-3, 11), (15, -4), (-5, 19), (23, -6), (-7, 27), (31, -9), (-10, 35), (39, -11), (-12, 43), (47, -13), (-15, 51), (55, -16), (-17, 59)],
         ),
     },
     "HYVideo-S/2-2branch-cross_attn": {

@@ -75,8 +75,22 @@ class FlowMatchDiscreteScheduler(SchedulerMixin, ConfigMixin):
         reverse: bool = True,
         solver: str = "euler",
         n_tokens: Optional[int] = None,
+        timestep_range: Optional[Tuple[int, int]] = None,
     ):
-        sigmas = torch.linspace(1, 0, num_train_timesteps + 1)
+        if timestep_range is None:
+            timestep_range = (0, num_train_timesteps)
+            
+        min_timestep, max_timestep = timestep_range
+        num_steps = max_timestep - min_timestep
+        
+        # Scale sigmas to represent the fraction of the total num_train_timesteps
+        sigma_max = max_timestep / num_train_timesteps
+        sigma_min = min_timestep / num_train_timesteps
+
+        # Generate sigmas restricted to the custom range
+        sigmas = torch.linspace(sigma_max, sigma_min, num_steps + 1)
+
+        # sigmas = torch.linspace(1, 0, num_train_timesteps + 1)
 
         if not reverse:
             sigmas = sigmas.flip(0)

@@ -413,7 +413,7 @@ if __name__ == "__main__":
     #===================DATASET & DATALOADER===================#
 
     dataset_root = args.dataset_root
-    dataset = RealEstate10K(dataset_root, set_name=args.task_flag, width=args.width, height=args.height, return_inverse_depth=True)
+    dataset = RealEstate10K(dataset_root, set_name=args.task_flag, width=args.width, height=args.height, return_inverse_depth=True, )
     dataloader = DataLoader(dataset, batch_size=ds_config["train_micro_batch_size_per_gpu"], shuffle=True, num_workers=args.num_workers)
 
     #===================MODEL, OPTIMIZER & DEEPSPEED INIT===================#

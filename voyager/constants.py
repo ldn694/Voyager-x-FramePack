@@ -147,6 +147,7 @@ FLOW_PREDICT_TYPE = {
     "velocity",             # Predict velocity
     "score",                # Predict score
     "noise",                # Predict noise
+    "velocity_flexidit",    # Predict velocity with flexible distillation targets
 }
 
 # Flow Matching loss weight

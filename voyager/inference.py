@@ -690,7 +690,7 @@ class HunyuanVideoSampler(Inference):
         return pipeline
 
     # 20250317 pftq: Modified to use Riflex when >192 frames
-    def get_rotary_pos_embed(self, video_length, height, width):
+    def get_rotary_pos_embed(self, video_length, height, width, use_old_patch_size=False):
         target_ndim = 3
         ndim = 5 - 2  # B, C, F, H, W -> F, H, W
 
@@ -705,22 +705,26 @@ class HunyuanVideoSampler(Inference):
             latents_size = [video_length, height // 8, width // 8]
 
         # Compute rope sizes
-        if isinstance(self.model.patch_size, int):
-            assert all(s % self.model.patch_size == 0 for s in latents_size), (
-                f"Latent size(last {ndim} dimensions) should be divisible by patch size({self.model.patch_size}), "
+        if hasattr(self.model, "old_patch_size") and use_old_patch_size:
+            ps = self.model.old_patch_size
+        else:
+            ps = self.model.patch_size
+        if isinstance(ps, int):
+            assert all(s % ps == 0 for s in latents_size), (
+                f"Latent size(last {ndim} dimensions) should be divisible by patch size({ps}), "
                 f"but got {latents_size}."
             )
-            rope_sizes = [s // self.model.patch_size for s in latents_size]
-        elif isinstance(self.model.patch_size, list):
+            rope_sizes = [s // ps for s in latents_size]
+        elif isinstance(ps, list):
             assert all(
-                s % self.model.patch_size[idx] == 0
+                s % ps[idx] == 0
                 for idx, s in enumerate(latents_size)
             ), (
-                f"Latent size(last {ndim} dimensions) should be divisible by patch size({self.model.patch_size}), "
+                f"Latent size(last {ndim} dimensions) should be divisible by patch size({ps}), "
                 f"but got {latents_size}."
             )
-            rope_sizes = [s // self.model.patch_size[idx]
-                          for idx, s in enumerate(latents_size)]
+            rope_sizes = [s // ps[idx]
+                        for idx, s in enumerate(latents_size)]
 
         if len(rope_sizes) != target_ndim:
             rope_sizes = [1] * (target_ndim - len(rope_sizes)
@@ -846,6 +850,8 @@ class HunyuanVideoSampler(Inference):
         partial_cond=None,
         partial_mask=None,
         use_kernel_indices=None,
+        step_sample=0,
+        attn_map=0,
         **kwargs,
     ):
         out_dict = dict()
@@ -1071,7 +1077,7 @@ class HunyuanVideoSampler(Inference):
             target_video_length, target_height, target_width
         )   
         freqs_cos_full, freqs_sin_full = self.get_rotary_pos_embed(
-            target_video_length, target_height, target_width
+            target_video_length, target_height, target_width, use_old_patch_size=True
         )   
         
         # Generate rotary position embeddings for conditional frames
@@ -1136,10 +1142,34 @@ class HunyuanVideoSampler(Inference):
             use_kernel_indices=use_kernel_indices,
             freqs_cis_full=(freqs_cos_full, freqs_sin_full),
             logger=logger,
-            mode_scheduler_name=self.args.mode_scheduler_name
+            mode_scheduler_name=self.args.mode_scheduler_name,
+            step_sample = step_sample,
+            attn_map = attn_map
         )[0]
-        out_dict["samples"] = samples
+
+
+        # if step_sample > 0 and isinstance(samples, tuple) and len(samples) > 1:
+        #     out_dict["samples"] = samples[0]       # The final video
+        #     out_dict["sample_list"] = samples[1]   # The list of intermediate (step, video) tuples
+        # else:
+        #     out_dict["samples"] = samples
+        #     out_dict["prompts"] = prompt
+
+        # gen_time = time.time() - start_time
+        # logger.info(f"Success, time: {gen_time}")
+
+        # return out_dict
+
+        # 1. Handle the samples logic
+        if step_sample > 0 and isinstance(samples, tuple) and len(samples) > 1:
+            out_dict["samples"] = samples[0]      # The final video
+            out_dict["sample_list"] = samples[1]  # The list of intermediate steps
+        else:
+            out_dict["samples"] = samples
+
+        # 2. ALWAYS add metadata (Move these OUTSIDE the if/else)
         out_dict["prompts"] = prompt
+        out_dict["seeds"] = [seed] * len(out_dict["samples"]) # Or however your seeds are tracked
 
         gen_time = time.time() - start_time
         logger.info(f"Success, time: {gen_time}")
