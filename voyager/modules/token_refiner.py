@@ -348,7 +348,7 @@ class SingleTokenRefiner(nn.Module):
             context_aware_representations = x.mean(dim=1)
         else:
             # Masked average pooling for padded sequences
-            mask_float = mask.float().unsqueeze(-1)  # [b, s1, 1]
+            mask_float = mask.to(x.dtype).unsqueeze(-1)  # [b, s1, 1]
             context_aware_representations = (x * mask_float).sum(
                 dim=1
             ) / mask_float.sum(dim=1)
