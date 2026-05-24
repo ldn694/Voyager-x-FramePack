@@ -548,7 +548,7 @@ def dmd2_fake_step(model_engine, denoiser, args, dmd2_cfg, t_grid, latents, forw
     target_dtype = PRECISION_TO_TYPE[args.precision]
     autocast_enabled = (target_dtype != torch.float32) and not args.disable_autocast
     with torch.autocast(device_type="cuda", dtype=model_engine.module.dtype, enabled=autocast_enabled):
-        fake_loss, _ = compute_fake_score_loss(
+        fake_loss, fake_info = compute_fake_score_loss(
             x_hat_0,
             forward_v,
             min_tp=dmd2_cfg.min_tp,
@@ -558,7 +558,7 @@ def dmd2_fake_step(model_engine, denoiser, args, dmd2_cfg, t_grid, latents, forw
 
     model_engine.backward(fake_loss)
     model_engine.step()
-    return float(fake_loss.detach().item())
+    return float(fake_loss.detach().item()), fake_info
 
 
 def dmd2_gen_step(model_engine, denoiser, args, dmd2_cfg, t_grid, latents, forward_v):
@@ -575,7 +575,7 @@ def dmd2_gen_step(model_engine, denoiser, args, dmd2_cfg, t_grid, latents, forwa
         v_pred = forward_v(dmd2_cfg.gen_adapter_name, x_t_in, t_i)
         x_hat_0 = compute_x_hat_0_from_velocity(x_t_in, v_pred, t_i)
 
-        gen_loss, _ = compute_dmd2_generator_loss(
+        gen_loss, gen_info = compute_dmd2_generator_loss(
             x_hat_0,
             forward_v,
             min_tp=dmd2_cfg.min_tp,
@@ -587,7 +587,7 @@ def dmd2_gen_step(model_engine, denoiser, args, dmd2_cfg, t_grid, latents, forwa
 
     model_engine.backward(gen_loss)
     model_engine.step()
-    return float(gen_loss.detach().item())
+    return float(gen_loss.detach().item()), gen_info
 
 
 def save_ckpt(args, model_engine, epoch, step, training_output_dir, total_skip):
@@ -1104,26 +1104,38 @@ if __name__ == "__main__":
                 )
 
                 fake_loss_vals = []
+                fake_infos = []
                 for _ in range(dmd2_cfg.fake_updates_per_gen):
-                    fake_loss_vals.append(
-                        dmd2_fake_step(model_engine, denoiser, args, dmd2_cfg, t_grid, latents, forward_v)
-                    )
+                    fval, finfo = dmd2_fake_step(model_engine, denoiser, args, dmd2_cfg, t_grid, latents, forward_v)
+                    fake_loss_vals.append(fval)
+                    fake_infos.append(finfo)
 
                 do_gen_update = dmd2_outer_step >= dmd2_cfg.fake_warmup_steps
                 gen_loss_val = None
+                gen_info_val = None
                 if do_gen_update:
-                    gen_loss_val = dmd2_gen_step(model_engine, denoiser, args, dmd2_cfg, t_grid, latents, forward_v)
+                    gen_loss_val, gen_info_val = dmd2_gen_step(model_engine, denoiser, args, dmd2_cfg, t_grid, latents, forward_v)
 
                 dmd2_outer_step += 1
 
                 avg_fake = sum(fake_loss_vals) / max(1, len(fake_loss_vals))
+                avg_fake_t_p = sum(i["t_p_mean"] for i in fake_infos) / len(fake_infos)
+                avg_fake_v_target_norm = sum(i["v_target_norm"] for i in fake_infos) / len(fake_infos)
                 if gen_loss_val is not None:
                     logger.info(
-                        f"[DMD2 outer={dmd2_outer_step}] fake_loss_avg={avg_fake:.4f} gen_loss={gen_loss_val:.4f}"
+                        f"[DMD2 outer={dmd2_outer_step}] "
+                        f"fake_loss_avg={avg_fake:.4f} fake_tp={avg_fake_t_p:.3f} fake_vtgt_norm={avg_fake_v_target_norm:.3f} | "
+                        f"gen_loss={gen_loss_val:.4f} "
+                        f"x_hat0_abs={gen_info_val['x_hat_0_abs_mean']:.4f} "
+                        f"grad_sig_norm={gen_info_val['grad_signal_norm']:.4f} "
+                        f"weight={gen_info_val['weight_mean']:.4f} "
+                        f"gen_tp={gen_info_val['t_p_mean']:.3f}"
                     )
                 else:
                     logger.info(
-                        f"[DMD2 outer={dmd2_outer_step}] fake_loss_avg={avg_fake:.4f} gen=warmup({dmd2_outer_step}/{dmd2_cfg.fake_warmup_steps})"
+                        f"[DMD2 outer={dmd2_outer_step}] "
+                        f"fake_loss_avg={avg_fake:.4f} fake_tp={avg_fake_t_p:.3f} fake_vtgt_norm={avg_fake_v_target_norm:.3f} | "
+                        f"gen=warmup({dmd2_outer_step}/{dmd2_cfg.fake_warmup_steps})"
                     )
 
                 # Surface a scalar for the rest of the loop's bookkeeping (loss logs, checkpoints).
