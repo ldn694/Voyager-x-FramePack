@@ -925,6 +925,9 @@ if __name__ == "__main__":
     avg_loss_values = []
     start_time = time.time()
     running_loss = 0.0
+    running_fake_loss = 0.0
+    running_gen_loss = 0.0
+    running_gen_count = 0
     total_skip = 0
     should_stop_training = False
 
@@ -1086,6 +1089,10 @@ if __name__ == "__main__":
             # save_videos_grid(image, "/raid/hvtham/ldnhuan/HunyuanWorld-Voyager/debug.mp4", fps=24)
             # # END DEBUG
 
+            avg_fake = None
+            gen_loss_val = None
+            fake_loss_vals = None
+
             if dmd2_active:
                 # ----- DMD2 two-timescale step -----
                 forward_v = make_dmd2_forward_v(
@@ -1142,26 +1149,65 @@ if __name__ == "__main__":
             # When one effective update is done
             if model_engine.global_rank == 0:
                 running_loss += loss
-                loss_values.append({
+                if dmd2_active:
+                    running_fake_loss += avg_fake
+                    if gen_loss_val is not None:
+                        running_gen_loss += gen_loss_val
+                        running_gen_count += 1
+
+                loss_entry = {
                     'step': global_step,
                     'loss': loss,
                     'sample_id': sample_id,
-                    'input_t': input_t
-                })
-                
+                    'input_t': input_t,
+                }
+                if dmd2_active:
+                    loss_entry['fake_loss_avg'] = avg_fake
+                    loss_entry['fake_loss_vals'] = fake_loss_vals
+                    if gen_loss_val is not None:
+                        loss_entry['gen_loss'] = gen_loss_val
+                loss_values.append(loss_entry)
+
                 if is_update_step:
                     avg_loss = running_loss / steps_per_update
-                    avg_loss_values.append({
+                    avg_entry = {
                         'step': global_step + 1,
                         'avg_loss': avg_loss,
                         'time': datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
-                    })
-                    logger.info(f"[Update {(global_step + 1) // steps_per_update}] avg_loss = {avg_loss:.4f}")
-                    running_loss = 0.0                                     
+                    }
+                    if dmd2_active:
+                        avg_entry['avg_fake_loss'] = running_fake_loss / steps_per_update
+                        if running_gen_count > 0:
+                            avg_entry['avg_gen_loss'] = running_gen_loss / running_gen_count
+                    avg_loss_values.append(avg_entry)
+
+                    log_msg = f"[Update {(global_step + 1) // steps_per_update}] avg_loss = {avg_loss:.4f}"
+                    if dmd2_active:
+                        log_msg += f" | avg_fake_loss = {avg_entry['avg_fake_loss']:.4f}"
+                        if 'avg_gen_loss' in avg_entry:
+                            log_msg += f" | avg_gen_loss = {avg_entry['avg_gen_loss']:.4f}"
+                    logger.info(log_msg)
+
+                    running_loss = 0.0
+                    running_fake_loss = 0.0
+                    running_gen_loss = 0.0
+                    running_gen_count = 0
+
                     with open(Path(training_output_dir) / 'loss_log.json', 'w') as f:
                         json.dump({'loss_values': loss_values, 'avg_loss_values': avg_loss_values}, f, indent=4)
+
                     plt.figure()
-                    plt.plot([v['step'] for v in avg_loss_values], [v['avg_loss'] for v in avg_loss_values])
+                    steps = [v['step'] for v in avg_loss_values]
+                    plt.plot(steps, [v['avg_loss'] for v in avg_loss_values], label='loss')
+                    if dmd2_active:
+                        fake_steps = [v['step'] for v in avg_loss_values if 'avg_fake_loss' in v]
+                        fake_vals  = [v['avg_fake_loss'] for v in avg_loss_values if 'avg_fake_loss' in v]
+                        if fake_steps:
+                            plt.plot(fake_steps, fake_vals, label='fake_loss')
+                        gen_pairs = [(v['step'], v['avg_gen_loss']) for v in avg_loss_values if 'avg_gen_loss' in v]
+                        if gen_pairs:
+                            plt.plot([s for s, _ in gen_pairs], [l for _, l in gen_pairs], label='gen_loss')
+                        plt.legend()
                     plt.xlabel('Step')
                     plt.ylabel('Avg Loss')
                     plt.title('Average Training Loss')
