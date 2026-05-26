@@ -32,6 +32,7 @@ from voyager.modules.lora_layers import (
     get_lora_state_dict,
     load_lora_state_dict,
     set_active_lora_adapter,
+    LoRALinear,
 )
 from voyager.diffusion.dmd2 import (
     DMD2Config,
@@ -585,6 +586,22 @@ def dmd2_gen_step(model_engine, denoiser, args, dmd2_cfg, t_grid, latents, forwa
             fake_adapter=dmd2_cfg.fake_adapter_name,
         )
 
+    # compute_dmd2_generator_loss leaves active_adapter on "fake" as a side
+    # effect of its no_grad real/fake forwards. With gradient checkpointing,
+    # backward re-runs the gen forward; that recomputation reads the *current*
+    # active_adapter and would otherwise route through "fake" — orphaning gen
+    # params and pumping the gen-surrogate gradient into the fake adapter.
+    set_active_lora_adapter(model_engine.module, dmd2_cfg.gen_adapter_name)
+    for _m in model_engine.module.modules():
+        if isinstance(_m, LoRALinear) and _m.active_adapter != dmd2_cfg.gen_adapter_name:
+            raise RuntimeError(
+                f"LoRALinear active_adapter={_m.active_adapter!r}, expected "
+                f"{dmd2_cfg.gen_adapter_name!r} just before backward. A new "
+                "adapter mutation snuck in between the gen loss and the "
+                "backward call; gradient-checkpoint recomputation would "
+                "route through the wrong LoRA branch."
+            )
+
     model_engine.backward(gen_loss)
     model_engine.step()
     return float(gen_loss.detach().item()), gen_info
@@ -928,6 +945,12 @@ if __name__ == "__main__":
     running_fake_loss = 0.0
     running_gen_loss = 0.0
     running_gen_count = 0
+    running_fake_tp = 0.0
+    running_fake_vtgt = 0.0
+    running_gen_grad_signal = 0.0
+    running_gen_x_hat_abs = 0.0
+    running_gen_weight = 0.0
+    running_gen_tp = 0.0
     total_skip = 0
     should_stop_training = False
 
@@ -1163,8 +1186,14 @@ if __name__ == "__main__":
                 running_loss += loss
                 if dmd2_active:
                     running_fake_loss += avg_fake
+                    running_fake_tp += avg_fake_t_p
+                    running_fake_vtgt += avg_fake_v_target_norm
                     if gen_loss_val is not None:
                         running_gen_loss += gen_loss_val
+                        running_gen_grad_signal += gen_info_val['grad_signal_norm']
+                        running_gen_x_hat_abs += gen_info_val['x_hat_0_abs_mean']
+                        running_gen_weight += gen_info_val['weight_mean']
+                        running_gen_tp += gen_info_val['t_p_mean']
                         running_gen_count += 1
 
                 loss_entry = {
@@ -1176,8 +1205,16 @@ if __name__ == "__main__":
                 if dmd2_active:
                     loss_entry['fake_loss_avg'] = avg_fake
                     loss_entry['fake_loss_vals'] = fake_loss_vals
+                    loss_entry['fake_tp_mean'] = avg_fake_t_p
+                    loss_entry['fake_v_target_norm'] = avg_fake_v_target_norm
+                    loss_entry['fake_tp_vals'] = [i["t_p_mean"] for i in fake_infos]
+                    loss_entry['fake_v_target_norm_vals'] = [i["v_target_norm"] for i in fake_infos]
                     if gen_loss_val is not None:
                         loss_entry['gen_loss'] = gen_loss_val
+                        loss_entry['gen_grad_signal_norm'] = gen_info_val['grad_signal_norm']
+                        loss_entry['gen_x_hat_0_abs_mean'] = gen_info_val['x_hat_0_abs_mean']
+                        loss_entry['gen_weight_mean'] = gen_info_val['weight_mean']
+                        loss_entry['gen_tp_mean'] = gen_info_val['t_p_mean']
                 loss_values.append(loss_entry)
 
                 if is_update_step:
@@ -1189,8 +1226,14 @@ if __name__ == "__main__":
                     }
                     if dmd2_active:
                         avg_entry['avg_fake_loss'] = running_fake_loss / steps_per_update
+                        avg_entry['avg_fake_tp_mean'] = running_fake_tp / steps_per_update
+                        avg_entry['avg_fake_v_target_norm'] = running_fake_vtgt / steps_per_update
                         if running_gen_count > 0:
                             avg_entry['avg_gen_loss'] = running_gen_loss / running_gen_count
+                            avg_entry['avg_gen_grad_signal_norm'] = running_gen_grad_signal / running_gen_count
+                            avg_entry['avg_gen_x_hat_0_abs_mean'] = running_gen_x_hat_abs / running_gen_count
+                            avg_entry['avg_gen_weight_mean'] = running_gen_weight / running_gen_count
+                            avg_entry['avg_gen_tp_mean'] = running_gen_tp / running_gen_count
                     avg_loss_values.append(avg_entry)
 
                     log_msg = f"[Update {(global_step + 1) // steps_per_update}] avg_loss = {avg_loss:.4f}"
@@ -1204,6 +1247,12 @@ if __name__ == "__main__":
                     running_fake_loss = 0.0
                     running_gen_loss = 0.0
                     running_gen_count = 0
+                    running_fake_tp = 0.0
+                    running_fake_vtgt = 0.0
+                    running_gen_grad_signal = 0.0
+                    running_gen_x_hat_abs = 0.0
+                    running_gen_weight = 0.0
+                    running_gen_tp = 0.0
 
                     with open(Path(training_output_dir) / 'loss_log.json', 'w') as f:
                         json.dump({'loss_values': loss_values, 'avg_loss_values': avg_loss_values}, f, indent=4)
@@ -1225,6 +1274,28 @@ if __name__ == "__main__":
                     plt.title('Average Training Loss')
                     plt.savefig(Path(training_output_dir) / 'avg_loss_curve.png')
                     plt.close()
+
+                    if dmd2_active:
+                        diag_keys = [
+                            'avg_gen_grad_signal_norm',
+                            'avg_gen_x_hat_0_abs_mean',
+                            'avg_gen_weight_mean',
+                            'avg_fake_v_target_norm',
+                        ]
+                        any_present = any(any(k in v for v in avg_loss_values) for k in diag_keys)
+                        if any_present:
+                            plt.figure()
+                            for k in diag_keys:
+                                pairs = [(v['step'], v[k]) for v in avg_loss_values if k in v]
+                                if pairs:
+                                    plt.plot([s for s, _ in pairs], [x for _, x in pairs], label=k)
+                            plt.xlabel('Step')
+                            plt.ylabel('Value')
+                            plt.yscale('log')
+                            plt.title('DMD2 diagnostics')
+                            plt.legend()
+                            plt.savefig(Path(training_output_dir) / 'dmd2_diagnostics_curve.png')
+                            plt.close()
             
             if is_update_step and args.save_every > 0 and (effective_update % args.save_every == 0):
                 save_ckpt(args, model_engine, epoch, step, training_output_dir, total_skip)
