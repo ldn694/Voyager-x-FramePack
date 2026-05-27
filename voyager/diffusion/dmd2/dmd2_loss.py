@@ -117,7 +117,18 @@ def compute_dmd2_generator_loss(
         v_real = forward_v(real_adapter, x_tp, t_p)
         v_fake = forward_v(fake_adapter, x_tp, t_p)
 
-    grad_signal = (v_fake - v_real).detach()
+    # Sign derivation for linear-reverse flow (v = noise - x_data):
+    #   score s_t(x_t) = -(x_t + (1-t)·v) / t
+    #   => s_gen - s_real = -(1-t)/t · (v_fake - v_real)
+    # DMD2 wants dL/dθ = (s_gen - s_real)·∂x_gen/∂θ so that descent on L is
+    # descent on KL(p_gen || p_real). With the (1-t)/t > 0 factor absorbed
+    # into the (positive) weight w, the correctly oriented surrogate is
+    #   L = -w · sg(v_fake - v_real) · x_hat_0
+    # i.e. the gradient signal is (v_real - v_fake), not (v_fake - v_real).
+    # Getting this wrong performs gradient *ascent* on KL — gen drifts off
+    # manifold, ||v_fake - v_real|| blows up, and the surrogate scalar
+    # becomes monotonically negative as the runaway proceeds.
+    grad_signal = (v_real - v_fake).detach()
     w = dmd_weight(x_hat_0, mode=weight_mode).detach()
     w_b = _expand_t(w, x_hat_0)
 
