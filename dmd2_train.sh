@@ -47,6 +47,12 @@ deepspeed --include localhost:3 --master_port=29506 deepspeed_train_render.py \
     --dmd2-weight-mode normalized \
     --dmd2-min-tp 0.02 \
     --dmd2-max-tp 0.98 \
+    # GAN extension (DMD2 §3.3) — uncomment to enable:
+    # --dmd2-use-gan \
+    # --dmd2-gan-weight-d 1.0 \
+    # --dmd2-gan-weight-g 1e-3 \
+    # --dmd2-gan-warmup-steps 200 \
     # Resume:
     # --resume-lora training_outputs/run_XXXXX/lora_gen_last.pt \
-    # --resume-dmd2-fake-lora training_outputs/run_XXXXX/lora_fake_last.pt
+    # --resume-dmd2-fake-lora training_outputs/run_XXXXX/lora_fake_last.pt \
+    # --resume-dmd2-disc training_outputs/run_XXXXX/dmd2_disc_last.pt

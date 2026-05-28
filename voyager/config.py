@@ -1003,6 +1003,40 @@ def add_dmd2_args(parser: argparse.ArgumentParser):
         default=None,
         help="Path to a fake-score LoRA checkpoint (.pt) to resume from.",
     )
+
+    # ----- GAN extension (DMD2 §3.3) -----
+    group.add_argument(
+        "--dmd2-use-gan",
+        action="store_true",
+        help="Enable the DMD2 GAN auxiliary: attach a per-token discriminator head "
+             "on the fake-score DiT, train it with a hinge loss inside the fake step, "
+             "and feed -mean(D(fake)) into the generator loss.",
+    )
+    group.add_argument(
+        "--dmd2-gan-weight-g",
+        type=float,
+        default=1e-3,
+        help="λ on the GAN term in the generator loss (default 1e-3, per DMD2 paper).",
+    )
+    group.add_argument(
+        "--dmd2-gan-weight-d",
+        type=float,
+        default=1.0,
+        help="λ on the hinge D loss added to the fake-score loss (default 1.0).",
+    )
+    group.add_argument(
+        "--dmd2-gan-warmup-steps",
+        type=int,
+        default=200,
+        help="Outer-loop steps before the GAN term is enabled in the generator loss. "
+             "D itself is trained from step 0 alongside the fake-score head.",
+    )
+    group.add_argument(
+        "--resume-dmd2-disc",
+        type=str,
+        default=None,
+        help="Path to a DMD2 discriminator-head checkpoint (.pt) to resume from.",
+    )
     return parser
 
 

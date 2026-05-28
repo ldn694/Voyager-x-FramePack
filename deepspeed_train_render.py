@@ -42,7 +42,15 @@ from voyager.diffusion.dmd2 import (
     compute_x_hat_0_from_velocity,
     compute_dmd2_generator_loss,
     compute_fake_score_loss,
+    attach_disc_head,
+    get_disc_head,
+    get_disc_parameters,
+    get_disc_state_dict,
+    load_disc_state_dict,
+    hinge_d_loss,
+    hinge_g_loss,
 )
+from voyager.diffusion.dmd2.dmd2_loss import sample_t_p as _sample_t_p
 from voyager.modules.custom_patch_embed import apply_patch_adapter_to_hunyuan_video, get_patch_adapter_parameters, get_patch_adapter_state_dict, load_patch_adapter_state_dict
 from voyager.modules.multi_kernel import apply_multikernel_to_hunyuan_video, get_multikernel_parameters, get_multikernel_state_dict, load_multikernel_state_dict
 from voyager.modules.double_branch import apply_double_branch_to_hunyuan_video, get_double_branch_parameters, get_double_branch_state_dict, load_double_branch_state_dict, TransformerBranchConfig
@@ -410,6 +418,26 @@ def save_dmd2_lora_checkpoint(model_engine, args, epoch, step, training_output_d
             logger.info(f"Saving DMD2 {adapter_name} LoRA checkpoint to {ckpt_path}")
             torch.save(ckpt, ckpt_path)
 
+
+def save_dmd2_disc_checkpoint(model_engine, args, epoch, step, training_output_dir, filename: str = "dmd2_disc_last.pt"):
+    """Gather and save the DMD2 discriminator head (no-op if not attached)."""
+    disc_params = get_disc_parameters(model_engine.module)
+    if not disc_params:
+        return
+    with deepspeed.zero.GatheredParameters(disc_params, modifier_rank=0):
+        if dist.get_rank() == 0:
+            sd = get_disc_state_dict(model_engine.module)
+            ckpt = {
+                "epoch": epoch,
+                "step_in_epoch": step,
+                "disc": sd,
+                "args": vars(args),
+            }
+            ckpt_path = Path(training_output_dir) / filename
+            logger.info(f"Saving DMD2 discriminator checkpoint to {ckpt_path}")
+            torch.save(ckpt, ckpt_path)
+
+
 def save_patch_adapter_checkpoint(model_engine, args, epoch, step, training_output_dir):
     """
     Gather and save only patch-adapter parameters (PatchEmbed + FinalLayer)
@@ -534,76 +562,235 @@ def _sample_t_i_from_grid(batch_size: int, t_grid: torch.Tensor, device) -> torc
     return t_grid[idx].to(torch.float32)
 
 
-def dmd2_fake_step(model_engine, denoiser, args, dmd2_cfg, t_grid, latents, forward_v):
-    """One fake-score update. Returns the loss scalar."""
+def dmd2_fake_step(model_engine, denoiser, args, dmd2_cfg, t_grid, latents, forward_v, *, disc_head=None):
+    """
+    One fake-score update. If `disc_head` is provided and `dmd2_cfg.use_gan`,
+    the hinge-D loss against (clean real x_data vs. generator x_hat_0) is added
+    to the same backward.
+
+    Returns:
+        (fake_loss_scalar, info_dict). `info_dict` contains the standard
+        fake-score diagnostics plus, when GAN is on, `d_loss`, `d_logits_real`,
+        `d_logits_fake`.
+    """
     model_engine.train()
     B = latents.shape[0]
     t_i = _sample_t_i_from_grid(B, t_grid, latents.device)
 
     with torch.no_grad():
-        noise = torch.randn_like(latents)
-        x_t_in = make_xt_linear_reverse(latents, noise, t_i)
-        v_pred = forward_v(dmd2_cfg.gen_adapter_name, x_t_in, t_i)
-        x_hat_0 = compute_x_hat_0_from_velocity(x_t_in, v_pred, t_i).detach()
+        noise_i = torch.randn_like(latents)
+        x_t_in = make_xt_linear_reverse(latents, noise_i, t_i)
+        v_pred_gen = forward_v(dmd2_cfg.gen_adapter_name, x_t_in, t_i)
+        x_hat_0 = compute_x_hat_0_from_velocity(x_t_in, v_pred_gen, t_i).detach()
+
+    do_gan = dmd2_cfg.use_gan and disc_head is not None and dmd2_cfg.gan_weight_d > 0
 
     target_dtype = PRECISION_TO_TYPE[args.precision]
     autocast_enabled = (target_dtype != torch.float32) and not args.disable_autocast
-    with torch.autocast(device_type="cuda", dtype=model_engine.module.dtype, enabled=autocast_enabled):
-        fake_loss, fake_info = compute_fake_score_loss(
-            x_hat_0,
-            forward_v,
-            min_tp=dmd2_cfg.min_tp,
-            max_tp=dmd2_cfg.max_tp,
-            fake_adapter=dmd2_cfg.fake_adapter_name,
-        )
 
-    model_engine.backward(fake_loss)
+    if not do_gan:
+        # Original code path, untouched.
+        with torch.autocast(device_type="cuda", dtype=model_engine.module.dtype, enabled=autocast_enabled):
+            fake_loss, fake_info = compute_fake_score_loss(
+                x_hat_0,
+                forward_v,
+                min_tp=dmd2_cfg.min_tp,
+                max_tp=dmd2_cfg.max_tp,
+                fake_adapter=dmd2_cfg.fake_adapter_name,
+            )
+        model_engine.backward(fake_loss)
+        model_engine.step()
+        return float(fake_loss.detach().item()), fake_info
+
+    # --- GAN-enabled fake step ----------------------------------------------
+    # Share a single t_p across the fake and real branches (matches DMD2 paper).
+    t_p = _sample_t_p(B, dmd2_cfg.min_tp, dmd2_cfg.max_tp, device=latents.device, dtype=torch.float32)
+
+    # Fake branch: perturb the generator's clean prediction.
+    noise_p_fake = torch.randn_like(x_hat_0)
+    x_tp_fake = make_xt_linear_reverse(x_hat_0, noise_p_fake, t_p)
+    v_target_fake = noise_p_fake - x_hat_0           # linear-reverse velocity target
+
+    # Real branch: perturb the ground-truth clean data with an independent noise draw.
+    noise_p_real = torch.randn_like(latents)
+    x_tp_real = make_xt_linear_reverse(latents, noise_p_real, t_p)
+
+    with torch.autocast(device_type="cuda", dtype=model_engine.module.dtype, enabled=autocast_enabled):
+        # The fake-score velocity ALSO serves as the D feature map.
+        v_pred_fake = forward_v(dmd2_cfg.fake_adapter_name, x_tp_fake, t_p)
+        v_pred_real = forward_v(dmd2_cfg.fake_adapter_name, x_tp_real, t_p)
+
+        fake_loss = (v_pred_fake - v_target_fake.to(v_pred_fake.dtype)).pow(2).mean()
+
+        logits_fake = disc_head(v_pred_fake)
+        logits_real = disc_head(v_pred_real)
+        d_loss = hinge_d_loss(logits_real, logits_fake)
+
+        total_loss = fake_loss + dmd2_cfg.gan_weight_d * d_loss
+
+    # Both forwards used the fake adapter -> active stays "fake" for backward
+    # recomputes under gradient checkpointing. (Defensive re-set in case some
+    # outer code mutated it.)
+    set_active_lora_adapter(model_engine.module, dmd2_cfg.fake_adapter_name)
+
+    model_engine.backward(total_loss)
     model_engine.step()
+
+    fake_info = {
+        "t_p_mean": float(t_p.mean().item()),
+        "v_target_norm": float(v_target_fake.flatten(1).norm(dim=1).mean().item()),
+        "d_loss": float(d_loss.detach().item()),
+        "d_logits_real": float(logits_real.detach().mean().item()),
+        "d_logits_fake": float(logits_fake.detach().mean().item()),
+    }
     return float(fake_loss.detach().item()), fake_info
 
 
-def dmd2_gen_step(model_engine, denoiser, args, dmd2_cfg, t_grid, latents, forward_v):
-    """One generator update. Returns the surrogate-loss scalar."""
+def dmd2_gen_step(
+    model_engine,
+    denoiser,
+    args,
+    dmd2_cfg,
+    t_grid,
+    latents,
+    forward_v,
+    *,
+    disc_head=None,
+    do_gan_g: bool = False,
+    fake_lora_params=None,
+    disc_params=None,
+):
+    """
+    One generator update. Returns the surrogate-loss scalar.
+
+    GAN extension:
+      When `do_gan_g` is True, an extra differentiable forward through the fake
+      adapter on `x_hat_0` (perturbed at an independent t_p) is added; D's logits
+      on that fake feature drive a hinge-G loss `-mean(D(fake))` that is summed
+      into the surrogate before backward. To avoid the fake-LoRA / D-head params
+      collecting gradients that the engine's `.step()` would mistakenly apply,
+      we temporarily set `requires_grad=False` on them around this block —
+      activations still flow, so the gradient still reaches x_hat_0 and on to
+      the gen params, but the fake/D params do not accumulate grads.
+
+      Gradient-checkpoint hazard:
+        The gen forward runs with active="gen". `compute_dmd2_generator_loss`
+        switches active to "fake" for its no_grad v_real/v_fake forwards. The
+        GAN forward then re-routes through active="fake" (checkpointed). At
+        backward, both the gen forward AND the GAN forward are recomputed, but
+        they need DIFFERENT active_adapter values during their respective
+        recomputes. We solve this by leaving active="fake" entering backward
+        (so the GAN forward's recompute is correct) and registering a hook on
+        x_hat_0 that flips active to "gen" the moment the autograd engine has
+        aggregated all gradients into x_hat_0 — i.e. exactly at the topological
+        boundary between the GAN sub-graph and the gen sub-graph.
+    """
     model_engine.train()
     B = latents.shape[0]
     t_i = _sample_t_i_from_grid(B, t_grid, latents.device)
 
     target_dtype = PRECISION_TO_TYPE[args.precision]
     autocast_enabled = (target_dtype != torch.float32) and not args.disable_autocast
-    with torch.autocast(device_type="cuda", dtype=model_engine.module.dtype, enabled=autocast_enabled):
-        noise = torch.randn_like(latents)
-        x_t_in = make_xt_linear_reverse(latents, noise, t_i)
-        v_pred = forward_v(dmd2_cfg.gen_adapter_name, x_t_in, t_i)
-        x_hat_0 = compute_x_hat_0_from_velocity(x_t_in, v_pred, t_i)
 
-        gen_loss, gen_info = compute_dmd2_generator_loss(
-            x_hat_0,
-            forward_v,
-            min_tp=dmd2_cfg.min_tp,
-            max_tp=dmd2_cfg.max_tp,
-            weight_mode=dmd2_cfg.weight_mode,
-            real_adapter=None,
-            fake_adapter=dmd2_cfg.fake_adapter_name,
-        )
+    # Freeze fake-LoRA + D-head params for the duration of the gen step's
+    # differentiable forward(s). Done OUTSIDE autocast so the toggle is
+    # observable when the autograd graph is constructed.
+    frozen_params = []
+    if do_gan_g:
+        frozen_params = list(fake_lora_params or []) + list(disc_params or [])
+        for p in frozen_params:
+            p.requires_grad = False
 
-    # compute_dmd2_generator_loss leaves active_adapter on "fake" as a side
-    # effect of its no_grad real/fake forwards. With gradient checkpointing,
-    # backward re-runs the gen forward; that recomputation reads the *current*
-    # active_adapter and would otherwise route through "fake" — orphaning gen
-    # params and pumping the gen-surrogate gradient into the fake adapter.
-    set_active_lora_adapter(model_engine.module, dmd2_cfg.gen_adapter_name)
-    for _m in model_engine.module.modules():
-        if isinstance(_m, LoRALinear) and _m.active_adapter != dmd2_cfg.gen_adapter_name:
-            raise RuntimeError(
-                f"LoRALinear active_adapter={_m.active_adapter!r}, expected "
-                f"{dmd2_cfg.gen_adapter_name!r} just before backward. A new "
-                "adapter mutation snuck in between the gen loss and the "
-                "backward call; gradient-checkpoint recomputation would "
-                "route through the wrong LoRA branch."
+    try:
+        with torch.autocast(device_type="cuda", dtype=model_engine.module.dtype, enabled=autocast_enabled):
+            noise = torch.randn_like(latents)
+            x_t_in = make_xt_linear_reverse(latents, noise, t_i)
+            v_pred = forward_v(dmd2_cfg.gen_adapter_name, x_t_in, t_i)
+            x_hat_0 = compute_x_hat_0_from_velocity(x_t_in, v_pred, t_i)
+
+            gen_loss, gen_info = compute_dmd2_generator_loss(
+                x_hat_0,
+                forward_v,
+                min_tp=dmd2_cfg.min_tp,
+                max_tp=dmd2_cfg.max_tp,
+                weight_mode=dmd2_cfg.weight_mode,
+                real_adapter=None,
+                fake_adapter=dmd2_cfg.fake_adapter_name,
             )
 
-    model_engine.backward(gen_loss)
-    model_engine.step()
+            if do_gan_g:
+                # Independent t_p draw for the GAN-G term. Reusing the surrogate's
+                # t_p would conflate two different roles of the perturbation and
+                # add correlation we don't want.
+                t_p_g = _sample_t_p(B, dmd2_cfg.min_tp, dmd2_cfg.max_tp, device=latents.device, dtype=torch.float32)
+                noise_g = torch.randn_like(x_hat_0)
+                x_tp_g = make_xt_linear_reverse(x_hat_0, noise_g, t_p_g)
+                v_pred_fake_g = forward_v(dmd2_cfg.fake_adapter_name, x_tp_g, t_p_g)
+                logits_fake_g = disc_head(v_pred_fake_g)
+                gan_g_loss = hinge_g_loss(logits_fake_g)
+                gen_info["g_gan_loss"] = float(gan_g_loss.detach().item())
+                gen_info["g_d_logits_fake_mean"] = float(logits_fake_g.detach().mean().item())
+                total_loss = gen_loss + dmd2_cfg.gan_weight_g * gan_g_loss
+            else:
+                total_loss = gen_loss
+
+        if do_gan_g:
+            # Register the active-adapter flip hook on x_hat_0. Fires once the
+            # autograd engine has aggregated both incoming gradient contributions
+            # (from gen_loss and gan_g_loss) at x_hat_0, BEFORE backward proceeds
+            # into x_hat_0's predecessors (the gen forward, which needs
+            # active="gen" at recompute time).
+            _adapter_name_gen = dmd2_cfg.gen_adapter_name
+            _module_for_hook = model_engine.module
+            def _flip_active_to_gen(_grad, _m=_module_for_hook, _n=_adapter_name_gen):
+                set_active_lora_adapter(_m, _n)
+                return None  # do not modify the gradient
+            x_hat_0.register_hook(_flip_active_to_gen)
+
+            # Leave active="fake" entering backward: the GAN forward's blocks
+            # are the FIRST to be re-run (autograd is LIFO over the forward
+            # graph), and they need active="fake". The hook then flips to "gen"
+            # at the x_hat_0 boundary so the gen forward's recompute is correct.
+            set_active_lora_adapter(model_engine.module, dmd2_cfg.fake_adapter_name)
+        else:
+            # Existing non-GAN path: compute_dmd2_generator_loss leaves active
+            # on "fake" as a side effect of its no_grad real/fake forwards.
+            # Reset to "gen" so the gen-forward recompute under gradient
+            # checkpointing routes through the gen adapter.
+            set_active_lora_adapter(model_engine.module, dmd2_cfg.gen_adapter_name)
+            for _m in model_engine.module.modules():
+                if isinstance(_m, LoRALinear) and _m.active_adapter != dmd2_cfg.gen_adapter_name:
+                    raise RuntimeError(
+                        f"LoRALinear active_adapter={_m.active_adapter!r}, expected "
+                        f"{dmd2_cfg.gen_adapter_name!r} just before backward. A new "
+                        "adapter mutation snuck in between the gen loss and the "
+                        "backward call; gradient-checkpoint recomputation would "
+                        "route through the wrong LoRA branch."
+                    )
+
+        model_engine.backward(total_loss)
+
+        if do_gan_g:
+            # Sanity: after backward, the frozen params must NOT have grads.
+            # If they do, optimizer.step() would corrupt the fake-score head /
+            # D head with a sign meant for the generator.
+            bad = []
+            for p in frozen_params:
+                if p.grad is not None and p.grad.abs().sum().item() > 0:
+                    bad.append(tuple(p.shape))
+            if bad:
+                raise RuntimeError(
+                    f"DMD2 gen step: {len(bad)} frozen params accumulated grads "
+                    f"({bad[:3]}...). requires_grad toggle did not prevent grad flow."
+                )
+
+        model_engine.step()
+    finally:
+        # Restore requires_grad. Note: model_engine.step() above clears grads,
+        # so re-enabling here is safe; the next fake step expects True.
+        for p in frozen_params:
+            p.requires_grad = True
+
     return float(gen_loss.detach().item()), gen_info
 
 
@@ -618,6 +805,7 @@ def save_ckpt(args, model_engine, epoch, step, training_output_dir, total_skip):
         # single-adapter save (which would mix gen+fake into one file).
         save_dmd2_lora_checkpoint(model_engine, args, epoch, step, training_output_dir, "gen", "lora_gen_last.pt")
         save_dmd2_lora_checkpoint(model_engine, args, epoch, step, training_output_dir, "fake", "lora_fake_last.pt")
+        save_dmd2_disc_checkpoint(model_engine, args, epoch, step, training_output_dir)
     elif args.train_lora:
         lora_ckpt_path = Path(training_output_dir) / f"lora_last.pt"
         logger.info(f"Saving LoRA checkpoint to {lora_ckpt_path}")
@@ -751,6 +939,24 @@ if __name__ == "__main__":
             # Default routing: generator active. The DMD2 inner loop flips this per call.
             set_active_lora_adapter(model, "gen")
             logger.info(f"DMD2 active: applied 'gen' (rank {args.lora_rank}) + 'fake' (rank {fake_r}) LoRA adapters.")
+
+            # GAN extension: attach a per-token discriminator head on the fake-net's
+            # final velocity output. in_channels matches the model's latent channel
+            # count (so the head is a single small Linear). Trained alongside the
+            # fake LoRA inside the fake step; used by both fake and gen steps.
+            if getattr(args, "dmd2_use_gan", False):
+                disc_in_channels = int(model.out_channels)
+                attach_disc_head(
+                    model,
+                    in_channels=disc_in_channels,
+                    dtype=dtype,
+                    device=args.device,
+                )
+                logger.info(
+                    f"DMD2 GAN active: attached disc head with in_channels={disc_in_channels}, "
+                    f"λ_D={args.dmd2_gan_weight_d}, λ_G={args.dmd2_gan_weight_g}, "
+                    f"gan_warmup={args.dmd2_gan_warmup_steps}."
+                )
         else:
             apply_lora_to_hunyuan_video(
                 model,
@@ -797,12 +1003,14 @@ if __name__ == "__main__":
     patch_params = get_patch_adapter_parameters(model) if args.patch_adapter_size is not None else []
     multikernel_params = get_multikernel_parameters(model) if args.train_multiple_kernels else []
     double_branch_params = get_double_branch_parameters(model) if args.use_double_branch else []
+    disc_head_params = get_disc_parameters(model) if dmd2_active and getattr(args, "dmd2_use_gan", False) else []
     logger.info(f"Number of LoRA parameters: {sum(p.numel() for p in lora_params)}")
     logger.info(f"Number of Patch Adapter parameters: {sum(p.numel() for p in patch_params)}")
     logger.info(f"Number of Multi-Kernel parameters: {sum(p.numel() for p in multikernel_params)}")
     logger.info(f"Number of Double Branch parameters: {sum(p.numel() for p in double_branch_params)}")
-    
-    trainable_addons_params = lora_params + patch_params + multikernel_params + double_branch_params
+    logger.info(f"Number of DMD2 Discriminator Head parameters: {sum(p.numel() for p in disc_head_params)}")
+
+    trainable_addons_params = lora_params + patch_params + multikernel_params + double_branch_params + disc_head_params
     for p in trainable_addons_params:
         p.requires_grad = True
     
@@ -859,6 +1067,17 @@ if __name__ == "__main__":
         ckpt = torch.load(args.resume_dmd2_fake_lora, map_location='cpu', weights_only=False)
         load_lora_state_dict(model, ckpt["lora"], strict=False, adapter_name="fake")
         logger.info("Resumed fake-score LoRA.")
+
+    if (
+        dmd2_active
+        and getattr(args, "dmd2_use_gan", False)
+        and getattr(args, "resume_dmd2_disc", None) is not None
+        and os.path.isfile(args.resume_dmd2_disc)
+    ):
+        logger.info(f"Resuming DMD2 discriminator head from {args.resume_dmd2_disc}")
+        ckpt = torch.load(args.resume_dmd2_disc, map_location='cpu', weights_only=False)
+        load_disc_state_dict(model, ckpt["disc"])
+        logger.info("Resumed DMD2 discriminator head.")
     
     if args.resume_multi_kernel is not None and os.path.isfile(args.resume_multi_kernel):
         logger.info(f"Resuming Multi-Kernel from {args.resume_multi_kernel}")
@@ -936,6 +1155,17 @@ if __name__ == "__main__":
             f"t_p in [{dmd2_cfg.min_tp}, {dmd2_cfg.max_tp}]"
         )
         logger.info(f"DMD2 t_grid: {t_grid.tolist()}")
+        if dmd2_cfg.use_gan:
+            logger.info(
+                f"DMD2 GAN enabled | λ_D={dmd2_cfg.gan_weight_d} | "
+                f"λ_G={dmd2_cfg.gan_weight_g} | gan_warmup={dmd2_cfg.gan_warmup_steps}"
+            )
+
+        # Cached references used by dmd2_gen_step to freeze fake-LoRA + D-head params
+        # during the gen step's differentiable GAN forward (see dmd2_gen_step docstring).
+        dmd2_disc_head = get_disc_head(model_engine.module) if dmd2_cfg.use_gan else None
+        dmd2_fake_lora_params_for_gen = get_lora_parameters(model_engine.module, adapter_name="fake") if dmd2_cfg.use_gan else []
+        dmd2_disc_params_for_gen = get_disc_parameters(model_engine.module) if dmd2_cfg.use_gan else []
 
     #===================TRAINING LOOP===================#
     loss_values = []
@@ -951,6 +1181,12 @@ if __name__ == "__main__":
     running_gen_x_hat_abs = 0.0
     running_gen_weight = 0.0
     running_gen_tp = 0.0
+    # GAN running counters (populated only when --dmd2-use-gan).
+    running_d_loss = 0.0
+    running_d_logits_real = 0.0
+    running_d_logits_fake = 0.0
+    running_gan_g_loss = 0.0
+    running_gan_g_count = 0
     total_skip = 0
     should_stop_training = False
 
@@ -1129,35 +1365,79 @@ if __name__ == "__main__":
                 fake_loss_vals = []
                 fake_infos = []
                 for _ in range(dmd2_cfg.fake_updates_per_gen):
-                    fval, finfo = dmd2_fake_step(model_engine, denoiser, args, dmd2_cfg, t_grid, latents, forward_v)
+                    fval, finfo = dmd2_fake_step(
+                        model_engine, denoiser, args, dmd2_cfg, t_grid, latents, forward_v,
+                        disc_head=dmd2_disc_head,
+                    )
                     fake_loss_vals.append(fval)
                     fake_infos.append(finfo)
 
                 do_gen_update = dmd2_outer_step >= dmd2_cfg.fake_warmup_steps
+                # GAN G term is held out of the gen loss until its own warmup.
+                do_gan_g = (
+                    dmd2_cfg.use_gan
+                    and dmd2_disc_head is not None
+                    and dmd2_cfg.gan_weight_g > 0
+                    and dmd2_outer_step >= dmd2_cfg.gan_warmup_steps
+                )
                 gen_loss_val = None
                 gen_info_val = None
                 if do_gen_update:
-                    gen_loss_val, gen_info_val = dmd2_gen_step(model_engine, denoiser, args, dmd2_cfg, t_grid, latents, forward_v)
+                    gen_loss_val, gen_info_val = dmd2_gen_step(
+                        model_engine, denoiser, args, dmd2_cfg, t_grid, latents, forward_v,
+                        disc_head=dmd2_disc_head,
+                        do_gan_g=do_gan_g,
+                        fake_lora_params=dmd2_fake_lora_params_for_gen,
+                        disc_params=dmd2_disc_params_for_gen,
+                    )
 
                 dmd2_outer_step += 1
 
                 avg_fake = sum(fake_loss_vals) / max(1, len(fake_loss_vals))
                 avg_fake_t_p = sum(i["t_p_mean"] for i in fake_infos) / len(fake_infos)
                 avg_fake_v_target_norm = sum(i["v_target_norm"] for i in fake_infos) / len(fake_infos)
+                # GAN diagnostics: only present when use_gan and disc_head is not None.
+                avg_d_loss = None
+                avg_d_logits_real = None
+                avg_d_logits_fake = None
+                if dmd2_cfg.use_gan and fake_infos and "d_loss" in fake_infos[0]:
+                    avg_d_loss = sum(i["d_loss"] for i in fake_infos) / len(fake_infos)
+                    avg_d_logits_real = sum(i["d_logits_real"] for i in fake_infos) / len(fake_infos)
+                    avg_d_logits_fake = sum(i["d_logits_fake"] for i in fake_infos) / len(fake_infos)
                 if gen_loss_val is not None:
+                    gan_part = ""
+                    if do_gan_g and "g_gan_loss" in gen_info_val:
+                        gan_part = (
+                            f" g_gan_loss={gen_info_val['g_gan_loss']:.4f}"
+                            f" g_d_logits_fake={gen_info_val['g_d_logits_fake_mean']:.4f}"
+                        )
+                    d_part = ""
+                    if avg_d_loss is not None:
+                        d_part = (
+                            f" d_loss={avg_d_loss:.4f}"
+                            f" d_logits_real={avg_d_logits_real:.4f}"
+                            f" d_logits_fake={avg_d_logits_fake:.4f}"
+                        )
                     logger.info(
                         f"[DMD2 outer={dmd2_outer_step}] "
-                        f"fake_loss_avg={avg_fake:.4f} fake_tp={avg_fake_t_p:.3f} fake_vtgt_norm={avg_fake_v_target_norm:.3f} | "
+                        f"fake_loss_avg={avg_fake:.4f} fake_tp={avg_fake_t_p:.3f} fake_vtgt_norm={avg_fake_v_target_norm:.3f}{d_part} | "
                         f"gen_loss={gen_loss_val:.4f} "
                         f"x_hat0_abs={gen_info_val['x_hat_0_abs_mean']:.4f} "
                         f"grad_sig_norm={gen_info_val['grad_signal_norm']:.4f} "
                         f"weight={gen_info_val['weight_mean']:.4f} "
-                        f"gen_tp={gen_info_val['t_p_mean']:.3f}"
+                        f"gen_tp={gen_info_val['t_p_mean']:.3f}{gan_part}"
                     )
                 else:
+                    d_part = ""
+                    if avg_d_loss is not None:
+                        d_part = (
+                            f" d_loss={avg_d_loss:.4f}"
+                            f" d_logits_real={avg_d_logits_real:.4f}"
+                            f" d_logits_fake={avg_d_logits_fake:.4f}"
+                        )
                     logger.info(
                         f"[DMD2 outer={dmd2_outer_step}] "
-                        f"fake_loss_avg={avg_fake:.4f} fake_tp={avg_fake_t_p:.3f} fake_vtgt_norm={avg_fake_v_target_norm:.3f} | "
+                        f"fake_loss_avg={avg_fake:.4f} fake_tp={avg_fake_t_p:.3f} fake_vtgt_norm={avg_fake_v_target_norm:.3f}{d_part} | "
                         f"gen=warmup({dmd2_outer_step}/{dmd2_cfg.fake_warmup_steps})"
                     )
 
@@ -1188,6 +1468,10 @@ if __name__ == "__main__":
                     running_fake_loss += avg_fake
                     running_fake_tp += avg_fake_t_p
                     running_fake_vtgt += avg_fake_v_target_norm
+                    if avg_d_loss is not None:
+                        running_d_loss += avg_d_loss
+                        running_d_logits_real += avg_d_logits_real
+                        running_d_logits_fake += avg_d_logits_fake
                     if gen_loss_val is not None:
                         running_gen_loss += gen_loss_val
                         running_gen_grad_signal += gen_info_val['grad_signal_norm']
@@ -1195,6 +1479,9 @@ if __name__ == "__main__":
                         running_gen_weight += gen_info_val['weight_mean']
                         running_gen_tp += gen_info_val['t_p_mean']
                         running_gen_count += 1
+                        if "g_gan_loss" in gen_info_val:
+                            running_gan_g_loss += gen_info_val['g_gan_loss']
+                            running_gan_g_count += 1
 
                 loss_entry = {
                     'step': global_step,
@@ -1209,12 +1496,19 @@ if __name__ == "__main__":
                     loss_entry['fake_v_target_norm'] = avg_fake_v_target_norm
                     loss_entry['fake_tp_vals'] = [i["t_p_mean"] for i in fake_infos]
                     loss_entry['fake_v_target_norm_vals'] = [i["v_target_norm"] for i in fake_infos]
+                    if avg_d_loss is not None:
+                        loss_entry['d_loss_avg'] = avg_d_loss
+                        loss_entry['d_logits_real_avg'] = avg_d_logits_real
+                        loss_entry['d_logits_fake_avg'] = avg_d_logits_fake
                     if gen_loss_val is not None:
                         loss_entry['gen_loss'] = gen_loss_val
                         loss_entry['gen_grad_signal_norm'] = gen_info_val['grad_signal_norm']
                         loss_entry['gen_x_hat_0_abs_mean'] = gen_info_val['x_hat_0_abs_mean']
                         loss_entry['gen_weight_mean'] = gen_info_val['weight_mean']
                         loss_entry['gen_tp_mean'] = gen_info_val['t_p_mean']
+                        if 'g_gan_loss' in gen_info_val:
+                            loss_entry['g_gan_loss'] = gen_info_val['g_gan_loss']
+                            loss_entry['g_d_logits_fake_mean'] = gen_info_val['g_d_logits_fake_mean']
                 loss_values.append(loss_entry)
 
                 if is_update_step:
@@ -1228,12 +1522,18 @@ if __name__ == "__main__":
                         avg_entry['avg_fake_loss'] = running_fake_loss / steps_per_update
                         avg_entry['avg_fake_tp_mean'] = running_fake_tp / steps_per_update
                         avg_entry['avg_fake_v_target_norm'] = running_fake_vtgt / steps_per_update
+                        if dmd2_cfg.use_gan:
+                            avg_entry['avg_d_loss'] = running_d_loss / steps_per_update
+                            avg_entry['avg_d_logits_real'] = running_d_logits_real / steps_per_update
+                            avg_entry['avg_d_logits_fake'] = running_d_logits_fake / steps_per_update
                         if running_gen_count > 0:
                             avg_entry['avg_gen_loss'] = running_gen_loss / running_gen_count
                             avg_entry['avg_gen_grad_signal_norm'] = running_gen_grad_signal / running_gen_count
                             avg_entry['avg_gen_x_hat_0_abs_mean'] = running_gen_x_hat_abs / running_gen_count
                             avg_entry['avg_gen_weight_mean'] = running_gen_weight / running_gen_count
                             avg_entry['avg_gen_tp_mean'] = running_gen_tp / running_gen_count
+                            if running_gan_g_count > 0:
+                                avg_entry['avg_g_gan_loss'] = running_gan_g_loss / running_gan_g_count
                     avg_loss_values.append(avg_entry)
 
                     log_msg = f"[Update {(global_step + 1) // steps_per_update}] avg_loss = {avg_loss:.4f}"
@@ -1253,6 +1553,11 @@ if __name__ == "__main__":
                     running_gen_x_hat_abs = 0.0
                     running_gen_weight = 0.0
                     running_gen_tp = 0.0
+                    running_d_loss = 0.0
+                    running_d_logits_real = 0.0
+                    running_d_logits_fake = 0.0
+                    running_gan_g_loss = 0.0
+                    running_gan_g_count = 0
 
                     with open(Path(training_output_dir) / 'loss_log.json', 'w') as f:
                         json.dump({'loss_values': loss_values, 'avg_loss_values': avg_loss_values}, f, indent=4)

@@ -23,6 +23,12 @@ class DMD2Config:
     gen_adapter_name: str = "gen"
     fake_adapter_name: str = "fake"
 
+    # ------ GAN extension (DMD2 §3.3). Disabled when use_gan=False. -----------
+    use_gan: bool = False
+    gan_weight_g: float = 1e-3                  # λ on -mean(D(fake)) in the gen loss
+    gan_weight_d: float = 1.0                   # λ on hinge D loss in the fake step
+    gan_warmup_steps: int = 200                 # outer-steps before GAN term joins gen loss
+
     def __post_init__(self) -> None:
         if self.num_steps <= 0:
             raise ValueError(f"DMD2Config.num_steps must be > 0, got {self.num_steps}")
@@ -32,6 +38,11 @@ class DMD2Config:
             raise ValueError(
                 f"Bad t_p range: min={self.min_tp}, max={self.max_tp}"
             )
+        if self.use_gan:
+            if self.gan_weight_g < 0 or self.gan_weight_d < 0:
+                raise ValueError("DMD2 GAN weights must be non-negative.")
+            if self.gan_warmup_steps < 0:
+                raise ValueError("dmd2_gan_warmup_steps must be >= 0.")
 
 
 def dmd2_config_from_args(args) -> DMD2Config:
@@ -51,4 +62,8 @@ def dmd2_config_from_args(args) -> DMD2Config:
         max_tp=args.dmd2_max_tp,
         fake_lr_mult=args.dmd2_fake_lr_mult,
         cfg_scale_real=args.dmd2_cfg_scale_real,
+        use_gan=getattr(args, "dmd2_use_gan", False),
+        gan_weight_g=getattr(args, "dmd2_gan_weight_g", 1e-3),
+        gan_weight_d=getattr(args, "dmd2_gan_weight_d", 1.0),
+        gan_warmup_steps=getattr(args, "dmd2_gan_warmup_steps", 200),
     )

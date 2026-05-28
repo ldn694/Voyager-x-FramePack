@@ -8,6 +8,16 @@ from .dmd2_loss import (
     compute_fake_score_loss,
 )
 from .sampler import dmd2_sample
+from .dmd2_gan import (
+    DMD2DiscriminatorHead,
+    attach_disc_head,
+    get_disc_head,
+    get_disc_parameters,
+    get_disc_state_dict,
+    load_disc_state_dict,
+    hinge_d_loss,
+    hinge_g_loss,
+)
 
 __all__ = [
     "DMD2Config",
@@ -19,4 +29,12 @@ __all__ = [
     "compute_dmd2_generator_loss",
     "compute_fake_score_loss",
     "dmd2_sample",
+    "DMD2DiscriminatorHead",
+    "attach_disc_head",
+    "get_disc_head",
+    "get_disc_parameters",
+    "get_disc_state_dict",
+    "load_disc_state_dict",
+    "hinge_d_loss",
+    "hinge_g_loss",
 ]

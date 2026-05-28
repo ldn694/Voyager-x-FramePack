@@ -418,3 +418,71 @@ python3 sample_image2video.py \
 3. **Resume**: stop and resume training; verify generator/fake checkpoints round-trip and the loss trajectory is continuous.
 4. **End-to-end smoke**: run inference with `--dmd2-steps 4` against the trained generator LoRA, eyeball a sample on `examples/case1`, then compare to 50-step base on the same input.
 5. **Ablation hooks**: `--dmd2-weight-mode uniform` and varying `--dmd2-fake-updates-per-gen` ∈ {1, 5, 10} to confirm sensitivity matches the paper's claims.
+
+---
+
+## 8. GAN extension (DMD2 §3.3)
+
+Enabled with `--dmd2-use-gan`. The fake-score DiT doubles as the discriminator's
+backbone — we attach a **per-token Linear head** (`voyager/diffusion/dmd2/dmd2_gan.py:DMD2DiscriminatorHead`)
+that operates on the fake net's *final velocity feature map* (B, C, T, H, W) and
+emits a single logit per sample by averaging per-cell logits. Default tap point
+is the final output (matches the existing `forward_v` closure with zero extra
+forward passes); switching to a mid-block hidden state is a one-line change to
+`in_channels` and an alternative feature extractor.
+
+### Losses (hinge, sign-checked)
+
+```
+L_D = mean(relu(1 - D(features_real))) + mean(relu(1 + D(features_fake)))   # fake step
+L_G = -mean(D(features_fake))                                               # gen step
+```
+
+`features_real` and `features_fake` are the fake-net velocities at perturbation
+timestep `t_p` (same path as the rest of DMD2 — `x_tp = (1-t_p)·x + t_p·ε`),
+with `x` being the ground-truth latents and the generator's `x_hat_0`
+respectively. `t_p` is shared between the real and fake branches of D inside a
+single fake step (and is independent of the perturbation `t_p` already used by
+`compute_dmd2_generator_loss`).
+
+### Two-timescale interaction
+
+- **Fake step (every iteration once `disc_head` exists):** one shared backward
+  on `L_fake_mse + λ_D · L_D`. Active LoRA adapter stays `"fake"` so the
+  gradient-checkpoint recomputes route through the right branch.
+- **Generator step (after `gan_warmup_steps`):** one shared backward on
+  `L_DMD + λ_G · L_G`. The gen forward runs with active=`"gen"`, the GAN
+  forward runs with active=`"fake"`; both are gradient-checkpointed so they get
+  recomputed at backward. We solve the "two recomputes need different
+  active_adapter" problem with:
+  1. `requires_grad=False` on the fake LoRA params and the D-head params for
+     the duration of the gen step, so `engine.step()` cannot inadvertently
+     update them with the GAN's G-side gradient (which only intends to update
+     the gen LoRA).
+  2. A `register_hook` on `x_hat_0` that flips `active_adapter` from `"fake"`
+     back to `"gen"` exactly when the autograd engine has aggregated all
+     incoming gradients at `x_hat_0` — i.e. between the GAN sub-graph's
+     recompute (active=`"fake"` ✓) and the gen forward's recompute
+     (active=`"gen"` ✓).
+  3. A post-backward assertion that the frozen params have zero accumulated
+     gradient. Triggers a hard `RuntimeError` if the `requires_grad` toggle
+     didn't take effect (which would corrupt the fake adapter).
+
+### New flags
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--dmd2-use-gan` | off | Master switch. |
+| `--dmd2-gan-weight-d` | 1.0 | `λ_D` on hinge D loss in the fake step. |
+| `--dmd2-gan-weight-g` | 1e-3 | `λ_G` on `-mean(D(fake))` in the gen step. |
+| `--dmd2-gan-warmup-steps` | 200 | Outer steps before `λ_G·L_G` joins the gen loss. D itself trains from step 0. |
+| `--resume-dmd2-disc` | None | Resume path for the discriminator head checkpoint (`dmd2_disc_last.pt`). |
+
+### Checkpointing
+
+Discriminator weights are saved to `dmd2_disc_last.pt` alongside the existing
+`lora_gen_last.pt` / `lora_fake_last.pt` files. The D head is also added to the
+DeepSpeed engine's `trainable_params` so ZeRO sharding and gradient all-reduce
+work transparently. Discriminator-head zero-init means `D(x) == 0` at the very
+first step, so the GAN term contributes nothing until D has accumulated signal
+— an extra safety belt on top of `--dmd2-gan-warmup-steps`.
