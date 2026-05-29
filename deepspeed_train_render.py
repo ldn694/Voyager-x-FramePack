@@ -562,7 +562,80 @@ def _sample_t_i_from_grid(batch_size: int, t_grid: torch.Tensor, device) -> torc
     return t_grid[idx].to(torch.float32)
 
 
-def dmd2_fake_step(model_engine, denoiser, args, dmd2_cfg, t_grid, latents, forward_v, *, disc_head=None):
+def _compute_lora_norms_per_adapter(model_engine, adapter_names=("gen", "fake")):
+    """
+    Diagnostic for hypothesis (A): if weight-decay on the DeepSpeed optimizer is
+    leaking onto the inactive adapter every step, both adapters' A norms should
+    drift downward monotonically (B starts at zero so it can only grow).
+
+    Returns: {adapter_name: {"A_norm": float, "B_norm": float, "A_count": int,
+              "B_count": int}}. With ZeRO stage 2 the full param tensors live on
+    every rank, so no GatheredParameters wrapping is needed.
+    """
+    a_sq = {n: 0.0 for n in adapter_names}
+    b_sq = {n: 0.0 for n in adapter_names}
+    a_count = {n: 0 for n in adapter_names}
+    b_count = {n: 0 for n in adapter_names}
+    for module in model_engine.module.modules():
+        if isinstance(module, LoRALinear):
+            for name, branch in module.adapters.items():
+                if name not in a_sq:
+                    continue
+                if branch.lora_A is not None:
+                    a_sq[name] += branch.lora_A.detach().float().pow(2).sum().item()
+                    a_count[name] += branch.lora_A.numel()
+                if branch.lora_B is not None:
+                    b_sq[name] += branch.lora_B.detach().float().pow(2).sum().item()
+                    b_count[name] += branch.lora_B.numel()
+    return {
+        n: {
+            "A_norm": float(a_sq[n] ** 0.5),
+            "B_norm": float(b_sq[n] ** 0.5),
+            "A_count": a_count[n],
+            "B_count": b_count[n],
+        }
+        for n in adapter_names
+    }
+
+
+def _grad_cosine_fake_mse_vs_gan(fake_loss, gan_d_loss_weighted, fake_lora_params):
+    """
+    Diagnostic for hypothesis (B): inside the GAN-enabled fake step the fake
+    LoRA receives gradients from BOTH (1) fake_loss = MSE(v_pred_fake, v_target)
+    and (2) λ_D · d_loss. If those two pull in opposing directions on the SAME
+    parameters, the cosine of the two gradient vectors will be negative and the
+    fake-LoRA's MSE objective is being broken by the discriminator term.
+
+    Uses torch.autograd.grad with retain_graph=True so the regular
+    model_engine.backward(total_loss) below remains valid. Cost: roughly two
+    extra backward recomputes through the gradient-checkpointed graph — gate
+    this at the call site so it only runs for a short prefix of outer steps.
+
+    Returns (cosine, fake_grad_norm, gan_grad_norm) as floats. Returns
+    (nan, nan, nan) if either gradient is empty/None.
+    """
+    grads_mse = torch.autograd.grad(
+        fake_loss, fake_lora_params,
+        retain_graph=True, allow_unused=True, create_graph=False,
+    )
+    grads_gan = torch.autograd.grad(
+        gan_d_loss_weighted, fake_lora_params,
+        retain_graph=True, allow_unused=True, create_graph=False,
+    )
+    flat_mse = [g.detach().float().flatten() for g in grads_mse if g is not None]
+    flat_gan = [g.detach().float().flatten() for g in grads_gan if g is not None]
+    if not flat_mse or not flat_gan:
+        return float("nan"), float("nan"), float("nan")
+    flat_mse_t = torch.cat(flat_mse)
+    flat_gan_t = torch.cat(flat_gan)
+    n_mse = flat_mse_t.norm()
+    n_gan = flat_gan_t.norm()
+    denom = (n_mse * n_gan).clamp(min=1e-12)
+    cos = (flat_mse_t * flat_gan_t).sum() / denom
+    return float(cos.item()), float(n_mse.item()), float(n_gan.item())
+
+
+def dmd2_fake_step(model_engine, denoiser, args, dmd2_cfg, t_grid, latents, forward_v, *, disc_head=None, fake_lora_params=None, log_grad_cosine=False):
     """
     One fake-score update. If `disc_head` is provided and `dmd2_cfg.use_gan`,
     the hinge-D loss against (clean real x_data vs. generator x_hat_0) is added
@@ -633,6 +706,29 @@ def dmd2_fake_step(model_engine, denoiser, args, dmd2_cfg, t_grid, latents, forw
     # outer code mutated it.)
     set_active_lora_adapter(model_engine.module, dmd2_cfg.fake_adapter_name)
 
+    # ----- Hypothesis (B) diagnostic ----------------------------------------
+    # Measure whether the MSE term and the GAN-D term pull the fake LoRA's
+    # parameters in opposing directions BEFORE running the real backward.
+    # Uses torch.autograd.grad so .grad on the params is untouched; the
+    # subsequent model_engine.backward(total_loss) still produces the correct
+    # accumulated grad for optimizer.step().
+    grad_cosine_info = {}
+    if log_grad_cosine and fake_lora_params is not None and len(fake_lora_params) > 0:
+        cos, gnorm_mse, gnorm_gan = _grad_cosine_fake_mse_vs_gan(
+            fake_loss,
+            dmd2_cfg.gan_weight_d * d_loss,
+            fake_lora_params,
+        )
+        grad_cosine_info = {
+            "fake_grad_cosine_mse_vs_gan": cos,
+            "fake_grad_norm_mse": gnorm_mse,
+            "fake_grad_norm_gan": gnorm_gan,
+        }
+        # The two autograd.grad calls above re-entered the gradient-checkpoint
+        # recompute path; defensively pin the active adapter back to "fake"
+        # in case any forward inside that path mutated it.
+        set_active_lora_adapter(model_engine.module, dmd2_cfg.fake_adapter_name)
+
     model_engine.backward(total_loss)
     model_engine.step()
 
@@ -643,6 +739,7 @@ def dmd2_fake_step(model_engine, denoiser, args, dmd2_cfg, t_grid, latents, forw
         "d_logits_real": float(logits_real.detach().mean().item()),
         "d_logits_fake": float(logits_fake.detach().mean().item()),
     }
+    fake_info.update(grad_cosine_info)
     return float(fake_loss.detach().item()), fake_info
 
 
@@ -1167,6 +1264,19 @@ if __name__ == "__main__":
         dmd2_fake_lora_params_for_gen = get_lora_parameters(model_engine.module, adapter_name="fake") if dmd2_cfg.use_gan else []
         dmd2_disc_params_for_gen = get_disc_parameters(model_engine.module) if dmd2_cfg.use_gan else []
 
+        # ------- Hypothesis-confirmation diagnostics (read-only logging) ----
+        # (A) Per-adapter LoRA norms: logged once per outer step.
+        # (B) Cosine of (∂fake_loss/∂fake_LoRA) vs (∂λ_D·d_loss/∂fake_LoRA):
+        #     only meaningful when GAN is on. Each measurement adds two extra
+        #     backward recomputes through the gradient-checkpointed graph, so
+        #     gate to a prefix of outer steps and only on the FIRST fake update
+        #     of each gated outer step.
+        DMD2_GRAD_COSINE_LOG_OUTER_STEPS = 100
+        dmd2_fake_lora_params_for_gradcos = (
+            get_lora_parameters(model_engine.module, adapter_name="fake")
+            if dmd2_cfg.use_gan else []
+        )
+
     #===================TRAINING LOOP===================#
     loss_values = []
     avg_loss_values = []
@@ -1187,6 +1297,13 @@ if __name__ == "__main__":
     running_d_logits_fake = 0.0
     running_gan_g_loss = 0.0
     running_gan_g_count = 0
+    # Hypothesis-(B) running counters: cosine of fake-LoRA gradient from
+    # fake_loss vs from λ_D·d_loss. Only populated on the first fake step of
+    # the first DMD2_GRAD_COSINE_LOG_OUTER_STEPS outer steps.
+    running_grad_cosine = 0.0
+    running_grad_norm_mse = 0.0
+    running_grad_norm_gan = 0.0
+    running_grad_cosine_count = 0
     total_skip = 0
     should_stop_training = False
 
@@ -1364,10 +1481,21 @@ if __name__ == "__main__":
 
                 fake_loss_vals = []
                 fake_infos = []
-                for _ in range(dmd2_cfg.fake_updates_per_gen):
+                for fake_iter in range(dmd2_cfg.fake_updates_per_gen):
+                    # Hypothesis (B) gate: only on the first fake update of each
+                    # outer step, and only for the first
+                    # DMD2_GRAD_COSINE_LOG_OUTER_STEPS outer steps, because each
+                    # measurement adds ~2 extra grad-ckpt recomputes.
+                    log_grad_cosine_now = (
+                        dmd2_cfg.use_gan
+                        and fake_iter == 0
+                        and dmd2_outer_step < DMD2_GRAD_COSINE_LOG_OUTER_STEPS
+                    )
                     fval, finfo = dmd2_fake_step(
                         model_engine, denoiser, args, dmd2_cfg, t_grid, latents, forward_v,
                         disc_head=dmd2_disc_head,
+                        fake_lora_params=dmd2_fake_lora_params_for_gradcos,
+                        log_grad_cosine=log_grad_cosine_now,
                     )
                     fake_loss_vals.append(fval)
                     fake_infos.append(finfo)
@@ -1392,6 +1520,16 @@ if __name__ == "__main__":
                     )
 
                 dmd2_outer_step += 1
+
+                # ---- Hypothesis (A) diagnostic: per-adapter LoRA norms -----
+                # Cheap (just reads param tensors) so we compute every outer step.
+                lora_norms_now = _compute_lora_norms_per_adapter(model_engine)
+                # ---- Hypothesis (B) diagnostic: pull cosine off the first ----
+                # fake update's info dict (only present when log_grad_cosine_now
+                # was True, i.e. GAN-on and outer_step in the gated prefix).
+                grad_cosine_now = fake_infos[0].get("fake_grad_cosine_mse_vs_gan")
+                grad_norm_mse_now = fake_infos[0].get("fake_grad_norm_mse")
+                grad_norm_gan_now = fake_infos[0].get("fake_grad_norm_gan")
 
                 avg_fake = sum(fake_loss_vals) / max(1, len(fake_loss_vals))
                 avg_fake_t_p = sum(i["t_p_mean"] for i in fake_infos) / len(fake_infos)
@@ -1418,6 +1556,19 @@ if __name__ == "__main__":
                             f" d_logits_real={avg_d_logits_real:.4f}"
                             f" d_logits_fake={avg_d_logits_fake:.4f}"
                         )
+                    # Diagnostic suffix: (A) adapter norms + (B) grad cosine.
+                    diag_part = (
+                        f" | A_gen={lora_norms_now['gen']['A_norm']:.4e}"
+                        f" B_gen={lora_norms_now['gen']['B_norm']:.4e}"
+                        f" A_fake={lora_norms_now['fake']['A_norm']:.4e}"
+                        f" B_fake={lora_norms_now['fake']['B_norm']:.4e}"
+                    )
+                    if grad_cosine_now is not None:
+                        diag_part += (
+                            f" | grad_cos(MSE,GAN-D)={grad_cosine_now:.4f}"
+                            f" gnorm_MSE={grad_norm_mse_now:.3e}"
+                            f" gnorm_GAN-D={grad_norm_gan_now:.3e}"
+                        )
                     logger.info(
                         f"[DMD2 outer={dmd2_outer_step}] "
                         f"fake_loss_avg={avg_fake:.4f} fake_tp={avg_fake_t_p:.3f} fake_vtgt_norm={avg_fake_v_target_norm:.3f}{d_part} | "
@@ -1425,7 +1576,7 @@ if __name__ == "__main__":
                         f"x_hat0_abs={gen_info_val['x_hat_0_abs_mean']:.4f} "
                         f"grad_sig_norm={gen_info_val['grad_signal_norm']:.4f} "
                         f"weight={gen_info_val['weight_mean']:.4f} "
-                        f"gen_tp={gen_info_val['t_p_mean']:.3f}{gan_part}"
+                        f"gen_tp={gen_info_val['t_p_mean']:.3f}{gan_part}{diag_part}"
                     )
                 else:
                     d_part = ""
@@ -1435,10 +1586,22 @@ if __name__ == "__main__":
                             f" d_logits_real={avg_d_logits_real:.4f}"
                             f" d_logits_fake={avg_d_logits_fake:.4f}"
                         )
+                    diag_part = (
+                        f" | A_gen={lora_norms_now['gen']['A_norm']:.4e}"
+                        f" B_gen={lora_norms_now['gen']['B_norm']:.4e}"
+                        f" A_fake={lora_norms_now['fake']['A_norm']:.4e}"
+                        f" B_fake={lora_norms_now['fake']['B_norm']:.4e}"
+                    )
+                    if grad_cosine_now is not None:
+                        diag_part += (
+                            f" | grad_cos(MSE,GAN-D)={grad_cosine_now:.4f}"
+                            f" gnorm_MSE={grad_norm_mse_now:.3e}"
+                            f" gnorm_GAN-D={grad_norm_gan_now:.3e}"
+                        )
                     logger.info(
                         f"[DMD2 outer={dmd2_outer_step}] "
                         f"fake_loss_avg={avg_fake:.4f} fake_tp={avg_fake_t_p:.3f} fake_vtgt_norm={avg_fake_v_target_norm:.3f}{d_part} | "
-                        f"gen=warmup({dmd2_outer_step}/{dmd2_cfg.fake_warmup_steps})"
+                        f"gen=warmup({dmd2_outer_step}/{dmd2_cfg.fake_warmup_steps}){diag_part}"
                     )
 
                 # Surface a scalar for the rest of the loop's bookkeeping (loss logs, checkpoints).
@@ -1482,6 +1645,17 @@ if __name__ == "__main__":
                         if "g_gan_loss" in gen_info_val:
                             running_gan_g_loss += gen_info_val['g_gan_loss']
                             running_gan_g_count += 1
+                    # Hypothesis (B) accumulator. NaN guard so a degenerate
+                    # cosine (all-zero grad) doesn't poison the running mean.
+                    if (
+                        grad_cosine_now is not None
+                        and isinstance(grad_cosine_now, float)
+                        and grad_cosine_now == grad_cosine_now  # not NaN
+                    ):
+                        running_grad_cosine += grad_cosine_now
+                        running_grad_norm_mse += grad_norm_mse_now
+                        running_grad_norm_gan += grad_norm_gan_now
+                        running_grad_cosine_count += 1
 
                 loss_entry = {
                     'step': global_step,
@@ -1509,6 +1683,20 @@ if __name__ == "__main__":
                         if 'g_gan_loss' in gen_info_val:
                             loss_entry['g_gan_loss'] = gen_info_val['g_gan_loss']
                             loss_entry['g_d_logits_fake_mean'] = gen_info_val['g_d_logits_fake_mean']
+                    # Hypothesis (A) per-step adapter norms.
+                    loss_entry['lora_norm_A_gen'] = lora_norms_now['gen']['A_norm']
+                    loss_entry['lora_norm_B_gen'] = lora_norms_now['gen']['B_norm']
+                    loss_entry['lora_norm_A_fake'] = lora_norms_now['fake']['A_norm']
+                    loss_entry['lora_norm_B_fake'] = lora_norms_now['fake']['B_norm']
+                    loss_entry['lora_count_A_gen'] = lora_norms_now['gen']['A_count']
+                    loss_entry['lora_count_B_gen'] = lora_norms_now['gen']['B_count']
+                    # Hypothesis (B) per-step cosine + raw grad norms (only on
+                    # the gated outer-step prefix; otherwise these keys are
+                    # absent).
+                    if grad_cosine_now is not None:
+                        loss_entry['fake_grad_cosine_mse_vs_gan'] = grad_cosine_now
+                        loss_entry['fake_grad_norm_mse'] = grad_norm_mse_now
+                        loss_entry['fake_grad_norm_gan'] = grad_norm_gan_now
                 loss_values.append(loss_entry)
 
                 if is_update_step:
@@ -1534,6 +1722,25 @@ if __name__ == "__main__":
                             avg_entry['avg_gen_tp_mean'] = running_gen_tp / running_gen_count
                             if running_gan_g_count > 0:
                                 avg_entry['avg_g_gan_loss'] = running_gan_g_loss / running_gan_g_count
+                        # Hypothesis (A) snapshot at the END of this averaging
+                        # window — adapter norms are a state (not a per-step
+                        # quantity), so we just record the most recent value.
+                        avg_entry['lora_norm_A_gen_last'] = lora_norms_now['gen']['A_norm']
+                        avg_entry['lora_norm_B_gen_last'] = lora_norms_now['gen']['B_norm']
+                        avg_entry['lora_norm_A_fake_last'] = lora_norms_now['fake']['A_norm']
+                        avg_entry['lora_norm_B_fake_last'] = lora_norms_now['fake']['B_norm']
+                        # Hypothesis (B) averaged cosine over the window.
+                        if running_grad_cosine_count > 0:
+                            avg_entry['avg_fake_grad_cosine_mse_vs_gan'] = (
+                                running_grad_cosine / running_grad_cosine_count
+                            )
+                            avg_entry['avg_fake_grad_norm_mse'] = (
+                                running_grad_norm_mse / running_grad_cosine_count
+                            )
+                            avg_entry['avg_fake_grad_norm_gan'] = (
+                                running_grad_norm_gan / running_grad_cosine_count
+                            )
+                            avg_entry['fake_grad_cosine_n_samples'] = running_grad_cosine_count
                     avg_loss_values.append(avg_entry)
 
                     log_msg = f"[Update {(global_step + 1) // steps_per_update}] avg_loss = {avg_loss:.4f}"
@@ -1558,6 +1765,10 @@ if __name__ == "__main__":
                     running_d_logits_fake = 0.0
                     running_gan_g_loss = 0.0
                     running_gan_g_count = 0
+                    running_grad_cosine = 0.0
+                    running_grad_norm_mse = 0.0
+                    running_grad_norm_gan = 0.0
+                    running_grad_cosine_count = 0
 
                     with open(Path(training_output_dir) / 'loss_log.json', 'w') as f:
                         json.dump({'loss_values': loss_values, 'avg_loss_values': avg_loss_values}, f, indent=4)
@@ -1600,6 +1811,49 @@ if __name__ == "__main__":
                             plt.title('DMD2 diagnostics')
                             plt.legend()
                             plt.savefig(Path(training_output_dir) / 'dmd2_diagnostics_curve.png')
+                            plt.close()
+
+                        # ---- Hypothesis (A) plot: per-adapter LoRA norms ----
+                        norm_keys = [
+                            'lora_norm_A_gen_last',
+                            'lora_norm_B_gen_last',
+                            'lora_norm_A_fake_last',
+                            'lora_norm_B_fake_last',
+                        ]
+                        norms_present = any(
+                            any(k in v for v in avg_loss_values) for k in norm_keys
+                        )
+                        if norms_present:
+                            plt.figure()
+                            for k in norm_keys:
+                                pairs = [(v['step'], v[k]) for v in avg_loss_values if k in v]
+                                if pairs:
+                                    plt.plot([s for s, _ in pairs], [x for _, x in pairs], label=k)
+                            plt.xlabel('Step')
+                            plt.ylabel('||param||_2')
+                            plt.title('LoRA adapter norms (Hypothesis A)')
+                            plt.legend()
+                            plt.savefig(Path(training_output_dir) / 'lora_norms_curve.png')
+                            plt.close()
+
+                        # ---- Hypothesis (B) plot: MSE vs GAN-D grad cosine ---
+                        cos_pairs = [
+                            (v['step'], v['avg_fake_grad_cosine_mse_vs_gan'])
+                            for v in avg_loss_values
+                            if 'avg_fake_grad_cosine_mse_vs_gan' in v
+                        ]
+                        if cos_pairs:
+                            plt.figure()
+                            xs = [s for s, _ in cos_pairs]
+                            ys = [x for _, x in cos_pairs]
+                            plt.plot(xs, ys, marker='o', label='cos(grad_MSE, grad_GAN-D)')
+                            plt.axhline(0.0, color='k', linewidth=0.5)
+                            plt.ylim(-1.05, 1.05)
+                            plt.xlabel('Step')
+                            plt.ylabel('cosine')
+                            plt.title('Fake-LoRA grad cosine: MSE vs λ_D·d_loss (Hypothesis B)')
+                            plt.legend()
+                            plt.savefig(Path(training_output_dir) / 'fake_lora_grad_cosine_curve.png')
                             plt.close()
             
             if is_update_step and args.save_every > 0 and (effective_update % args.save_every == 0):
