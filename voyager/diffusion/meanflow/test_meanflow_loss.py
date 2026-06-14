@@ -231,8 +231,33 @@ def test_meanflow_adapter_roundtrip(dtype=torch.float64):
     print("test_meanflow_adapter_roundtrip: PASSED")
 
 
+def test_meanflow_sampler_math():
+    """Few-step schedule + the z_r = z_t - (t-r)*u recursion (no model needed)."""
+    from .meanflow_sampler import meanflow_timesteps, meanflow_sample
+
+    assert meanflow_timesteps(1) == [(1.0, 0.0)]
+    pairs2 = meanflow_timesteps(2)
+    assert len(pairs2) == 2 and pairs2[0][0] == 1.0 and pairs2[-1][1] == 0.0
+    # contiguous intervals covering [0,1]
+    for i in range(len(pairs2) - 1):
+        assert abs(pairs2[i][1] - pairs2[i + 1][0]) < 1e-9
+
+    torch.manual_seed(0)
+    z = torch.randn(2, 3, 1, 4, 4)
+
+    # constant-velocity field u≡c: 1-step gives x = z - c; N-step telescopes to the same.
+    c = torch.randn_like(z)
+    forward_u = lambda z_data, t, r: c
+    x1 = meanflow_sample(z, forward_u, num_steps=1)
+    torch.testing.assert_close(x1, z - c)
+    x4 = meanflow_sample(z, forward_u, num_steps=4)
+    torch.testing.assert_close(x4, z - c)  # sum of (t_i - r_i) = 1
+    print("test_meanflow_sampler_math: PASSED")
+
+
 if __name__ == "__main__":
     test_meanflow_identity_math()
     test_meanflow_training_losses_smoke()
     test_meanflow_adapter_roundtrip()
+    test_meanflow_sampler_math()
     print("MEANFLOW LOSS CPU TESTS PASSED")
