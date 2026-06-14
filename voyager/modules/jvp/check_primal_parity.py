@@ -60,6 +60,10 @@ def _build_dit_only(args, device):
     model = load_model(args, in_channels=in_channels, out_channels=out_channels, factor_kwargs=factor_kwargs)
     model_base = os.environ.get("MODEL_BASE", "ckpts")
     model = load_state_dict(args, model, logger, Path(model_base))
+    # load_state_dict can leave params on CPU (inference normally uses cpu-offload,
+    # and load_models comments out its .to(device)); force the whole DiT onto the GPU
+    # so a single dense forward runs without device-mismatch.
+    model = model.to(device=device, dtype=PRECISION_TO_TYPE[args.precision])
     model.eval()
     return model
 
