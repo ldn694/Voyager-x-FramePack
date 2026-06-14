@@ -8,8 +8,11 @@ weights so the comparison is meaningful::
 
     MODEL_BASE=ckpts python -m voyager.modules.jvp.check_primal_parity \
         --model HYVideo-T/2 --vae 884-16c-hy \
-        --i2v-mode --i2v-condition-type latent_concat \
+        --i2v-condition-type latent_concat \
         --embedded-cfg-scale 6.0 --flow-reverse
+
+(``--i2v-mode`` defaults to True and *takes a value* — omit it, or pass
+``--i2v-mode True``; do not pass it as a bare flag.)
 
 It builds ONLY the DiT (``load_model`` + ``load_state_dict`` — no VAE / text
 encoders), synthesises one correctly-shaped ``latent_concat`` batch (batch size 1),
