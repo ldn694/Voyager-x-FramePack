@@ -27,7 +27,7 @@ thing this proves on real data is that the dense ``attention_withT`` over
 Tangents are zero here (the primal is invariant to them), so a mismatch isolates to
 the forward path, not the tangent math (that is covered by the CPU/GPU JVP tests).
 
-Latent grid size is taken from ``--height/--width`` (÷8 spatial) and the env vars
+Latent grid size is taken from ``--video-size H W`` (÷8 spatial) and the env vars
 ``PARITY_LAT_T`` (default 13), ``PARITY_TXT_LEN`` (default 64), ``PARITY_TXT_TRUE``
 (default 48) so no dataset / renderer is needed.
 
@@ -45,7 +45,7 @@ from loguru import logger
 from voyager.config import parse_args
 from voyager.constants import PRECISION_TO_TYPE
 from voyager.modules import load_model
-from voyager.utils.train_utils import load_state_dict, build_rope
+from voyager.utils.train_utils import load_state_dict, get_rope_freq_from_size
 from voyager.modules.jvp.jvp_model import model_forward_jvp
 from voyager.modules.jvp.jvp_attention import attention_withT
 
@@ -81,8 +81,8 @@ def main():
     # ---- synthesise one latent_concat batch (B=1) ----
     B = 1
     Tlat = int(os.environ.get("PARITY_LAT_T", "13"))
-    Hlat = args.height // 8
-    Wlat = args.width // 8
+    Hlat = args.video_size[0] // 8
+    Wlat = args.video_size[1] // 8
     pt, ph, pw = model.patch_size
     # make spatial dims divisible by the patch size
     Hlat -= Hlat % ph
@@ -109,8 +109,14 @@ def main():
     text_mask[:, :true_len] = 1
     text_states_2 = torch.randn(B, model.text_states_dim_2, device=device, dtype=dtype)
 
-    # ---- RoPE freqs (built from the un-concatenated latent, like training) ----
-    freqs_cos, freqs_sin = build_rope(z, args, model)
+    # ---- RoPE freqs (standard backbone) ----
+    # Call get_rope_freq_from_size directly rather than build_rope: build_rope's
+    # wrapper reads the training-only arg `train_multiple_kernels`, absent from the
+    # eval-mode namespace. For the standard backbone this is exactly the inference path.
+    latents_size = list(z.shape[-3:])  # [T, H, W] latent grid
+    freqs_cos, freqs_sin = get_rope_freq_from_size(
+        args, model, latents_size, ndim=3, target_ndim=3,
+    )
     freqs_cos = freqs_cos.to(device)
     freqs_sin = freqs_sin.to(device)
 
