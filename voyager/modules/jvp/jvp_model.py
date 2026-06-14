@@ -57,11 +57,18 @@ def model_forward_jvp(
     freqs_cos: Optional[torch.Tensor],
     freqs_sin: Optional[torch.Tensor],
     guidance: Optional[torch.Tensor] = None,
+    extra_vec: Optional[torch.Tensor] = None,
     attn_op: Callable[[TensorWithT, TensorWithT, TensorWithT], TensorWithT] = attention_withT,
 ) -> TensorWithT:
     """JVP of the standard Hunyuan DiT forward. Returns ``(out, t_out)``.
 
     ``out`` has shape ``[B, C, T, H, W]`` like ``model.forward(..., return_dict=False)``.
+
+    ``extra_vec`` (optional) is a CONSTANT-tangent term added to the modulation
+    vector ``vec`` — used by MeanFlow to inject the second-time ``r`` embedding
+    ``r_in(input_r)``. Because ``r`` is constant along the JVP direction
+    (tangent ``0`` on ``r``), this term contributes nothing to ``t_vec``; it only
+    shifts the primal modulation, exactly like ``vector_in``/``guidance_in``.
     """
     x, t_x = x_withT
     t, t_t = t_withT
@@ -84,6 +91,8 @@ def model_forward_jvp(
         if guidance is None:
             raise ValueError("guidance-distilled model requires `guidance`")
         vec = vec + model.guidance_in(guidance)           # constant add, tangent unchanged
+    if extra_vec is not None:
+        vec = vec + extra_vec                              # MeanFlow r-embedding (zero tangent)
     t_vec = t_vec.detach()
 
     # ---- patchify the latent (tangent from x) ----

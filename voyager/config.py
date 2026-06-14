@@ -1040,6 +1040,51 @@ def add_dmd2_args(parser: argparse.ArgumentParser):
     return parser
 
 
+def add_meanflow_args(parser: argparse.ArgumentParser):
+    """MeanFlow few-step distillation (average-velocity, JVP-based, no teacher).
+
+    Pass ``--train-meanflow`` to switch the training loop into MeanFlow mode. The
+    student conditions on two times ``u_theta(z, r, t)`` (a zero-init ``r_in``
+    embedder is attached on top of the base model) and is trained with the MeanFlow
+    identity ``u = v - (t-r)·d/dt u`` via the JVP path. Combine with ``--train-lora``
+    to fine-tune a LoRA adapter (recommended) or ``--train-from-scratch`` for full
+    fine-tuning. Requires ``--flow-reverse`` (the rectified-flow path convention).
+    """
+    group = parser.add_argument_group(title="MeanFlow distillation")
+
+    group.add_argument(
+        "--train-meanflow",
+        action="store_true",
+        help="Enable MeanFlow distillation training (average-velocity, JVP target).",
+    )
+    group.add_argument(
+        "--meanflow-flow-ratio",
+        type=float,
+        default=0.5,
+        help="Fraction of samples with r == t (pure flow-matching; the identity's "
+             "second term vanishes). The rest sample r < t.",
+    )
+    group.add_argument(
+        "--meanflow-loss-c",
+        type=float,
+        default=1e-3,
+        help="Adaptive-loss constant c in w = 1/(||Δ||²+c)^p.",
+    )
+    group.add_argument(
+        "--meanflow-loss-p",
+        type=float,
+        default=1.0,
+        help="Adaptive-loss exponent p in w = 1/(||Δ||²+c)^p (1.0 ≈ sCM tangent norm).",
+    )
+    group.add_argument(
+        "--resume-meanflow",
+        type=str,
+        default=None,
+        help="Path to a MeanFlow r_in checkpoint (.pt) to resume from.",
+    )
+    return parser
+
+
 def sanity_check_args(args):
     """Validate and sanity check parsed arguments
     
