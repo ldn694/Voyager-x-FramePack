@@ -51,6 +51,13 @@ from voyager.diffusion.dmd2 import (
     hinge_g_loss,
 )
 from voyager.diffusion.dmd2.dmd2_loss import sample_t_p as _sample_t_p
+from voyager.diffusion.meanflow import (
+    apply_meanflow_to_hunyuan_video,
+    get_meanflow_parameters,
+    get_meanflow_state_dict,
+    load_meanflow_state_dict,
+    meanflow_training_losses,
+)
 from voyager.modules.custom_patch_embed import apply_patch_adapter_to_hunyuan_video, get_patch_adapter_parameters, get_patch_adapter_state_dict, load_patch_adapter_state_dict
 from voyager.modules.multi_kernel import apply_multikernel_to_hunyuan_video, get_multikernel_parameters, get_multikernel_state_dict, load_multikernel_state_dict
 from voyager.modules.double_branch import apply_double_branch_to_hunyuan_video, get_double_branch_parameters, get_double_branch_state_dict, load_double_branch_state_dict, TransformerBranchConfig
@@ -206,6 +213,7 @@ def parse_arg():
     parser = add_multiple_kernel_args(parser)
     parser = add_double_branch_args(parser)
     parser = add_dmd2_args(parser)
+    parser = add_meanflow_args(parser)
 
     args = parser.parse_args()
     args.kernel_sizes = as_list_of_3tuple(args.kernel_sizes) if args.kernel_sizes is not None else None
@@ -283,6 +291,59 @@ def training_step(
         return loss.item()
     else:
         return loss.item(), terms["input_t"]
+
+
+def training_step_meanflow(
+    x1,
+    cond_latents,
+    model_engine,
+    denoiser: Transport,
+    args,
+    model_kwargs: Optional[dict] = None,
+    partial_cond=None,
+    partial_mask=None,
+):
+    """One MeanFlow distillation step (average-velocity, JVP target; no teacher).
+
+    Mirrors ``training_step`` but routes the forward through the JVP path
+    (``meanflow_training_losses``) instead of ``denoiser.training_losses``.
+    """
+    x1 = x1.to(model_engine.device)
+    model_engine.train()
+    target_dtype = PRECISION_TO_TYPE[args.precision]
+    autocast_enabled = (target_dtype != torch.float32) and not args.disable_autocast
+
+    logger.info("Starting MeanFlow training step...")
+    start_training_time = time.time()
+
+    with torch.autocast(
+        device_type="cuda",
+        dtype=model_engine.module.dtype,
+        enabled=autocast_enabled,
+    ):
+        _, terms = meanflow_training_losses(
+            model_engine.module,
+            denoiser,
+            x1,
+            args=args,
+            model_kwargs=model_kwargs,
+            cond_latents=cond_latents,
+            partial_cond=partial_cond,
+            partial_mask=partial_mask,
+        )
+
+    loss = terms["loss"].mean()
+    logger.info(
+        f"MeanFlow loss: {loss.item()} (r==t frac {terms['r_eq_t_frac']:.2f}) "
+        f"in {time.time() - start_training_time:.2f}s, starting backward..."
+    )
+
+    backward_start_time = time.time()
+    model_engine.backward(loss)
+    model_engine.step()
+    logger.info(f"Completed backward + step in {time.time() - backward_start_time:.2f}s.")
+
+    return loss.item(), terms["input_t"]
 
 
 def load_rgbs_depths(rgbs, depths, placeholder_row_length):
@@ -505,6 +566,23 @@ def save_double_branch_checkpoint(model_engine, args, epoch, step, training_outp
             ckpt_path = Path(training_output_dir) / "double_branch_last.pt"
             logger.info(f"Saving Double Branch checkpoint to {ckpt_path}")
             torch.save(ckpt, ckpt_path)
+
+def save_meanflow_checkpoint(model_engine, args, epoch, step, training_output_dir):
+    """Gather and save only the MeanFlow ``r_in`` parameters (ZeRO-sharded engine)."""
+    r_in_params = get_meanflow_parameters(model_engine.module)
+    with deepspeed.zero.GatheredParameters(r_in_params, modifier_rank=0):
+        if dist.get_rank() == 0:
+            r_in_sd = get_meanflow_state_dict(model_engine.module)
+            ckpt = {
+                "epoch": epoch,
+                "step_in_epoch": step,
+                "meanflow": r_in_sd,
+                "args": vars(args),
+            }
+            ckpt_path = Path(training_output_dir) / "meanflow_last.pt"
+            logger.info(f"Saving MeanFlow r_in checkpoint to {ckpt_path}")
+            torch.save(ckpt, ckpt_path)
+
 
 def make_dmd2_forward_v(model_engine, denoiser, args, *, cond_latents, partial_cond, partial_mask, model_kwargs):
     """
@@ -919,6 +997,10 @@ def save_ckpt(args, model_engine, epoch, step, training_output_dir, total_skip):
         double_branch_ckpt_path = Path(training_output_dir) / f"double_branch_last.pt"
         logger.info(f"Saving Double Branch checkpoint to {double_branch_ckpt_path}")
         save_double_branch_checkpoint(model_engine, args, epoch, step, training_output_dir)
+    if getattr(args, "train_meanflow", False):
+        meanflow_ckpt_path = Path(training_output_dir) / f"meanflow_last.pt"
+        logger.info(f"Saving MeanFlow checkpoint to {meanflow_ckpt_path}")
+        save_meanflow_checkpoint(model_engine, args, epoch, step, training_output_dir)
 
 if __name__ == "__main__":
     deepspeed.init_distributed()
@@ -1009,6 +1091,15 @@ if __name__ == "__main__":
     if dmd2_active and not args.train_lora:
         raise ValueError("--dmd2-steps requires --train-lora (DMD2 uses LoRA adapters for the generator).")
 
+    meanflow_active = getattr(args, "train_meanflow", False)
+    if meanflow_active:
+        if dmd2_active:
+            raise ValueError("--train-meanflow and --dmd2-steps are mutually exclusive distillation modes.")
+        if not (args.i2v_mode and args.i2v_condition_type == "latent_concat"):
+            raise ValueError("--train-meanflow requires i2v latent_concat mode.")
+        if not getattr(args, "flow_reverse", False):
+            raise ValueError("--train-meanflow requires --flow-reverse (rectified-flow path convention).")
+
     if args.train_lora:
         logger.info("Applying LoRA adapters to model...")
         # In DMD2 mode we attach TWO named adapters on top of the same frozen base:
@@ -1095,19 +1186,24 @@ if __name__ == "__main__":
             dtype=dtype,
             freeze_base=not args.train_from_scratch,
         )
+    if meanflow_active:
+        logger.info("Applying MeanFlow second-time (r) embedder to model...")
+        apply_meanflow_to_hunyuan_video(model)
 
     lora_params = get_lora_parameters(model) if args.train_lora else []
     patch_params = get_patch_adapter_parameters(model) if args.patch_adapter_size is not None else []
     multikernel_params = get_multikernel_parameters(model) if args.train_multiple_kernels else []
     double_branch_params = get_double_branch_parameters(model) if args.use_double_branch else []
     disc_head_params = get_disc_parameters(model) if dmd2_active and getattr(args, "dmd2_use_gan", False) else []
+    meanflow_params = get_meanflow_parameters(model) if meanflow_active else []
     logger.info(f"Number of LoRA parameters: {sum(p.numel() for p in lora_params)}")
     logger.info(f"Number of Patch Adapter parameters: {sum(p.numel() for p in patch_params)}")
     logger.info(f"Number of Multi-Kernel parameters: {sum(p.numel() for p in multikernel_params)}")
     logger.info(f"Number of Double Branch parameters: {sum(p.numel() for p in double_branch_params)}")
     logger.info(f"Number of DMD2 Discriminator Head parameters: {sum(p.numel() for p in disc_head_params)}")
+    logger.info(f"Number of MeanFlow r_in parameters: {sum(p.numel() for p in meanflow_params)}")
 
-    trainable_addons_params = lora_params + patch_params + multikernel_params + double_branch_params + disc_head_params
+    trainable_addons_params = lora_params + patch_params + multikernel_params + double_branch_params + disc_head_params + meanflow_params
     for p in trainable_addons_params:
         p.requires_grad = True
     
@@ -1202,7 +1298,13 @@ if __name__ == "__main__":
         load_patch_adapter_state_dict(model, ckpt["patch_adapter"], strict=False)
 
         logger.info("Resumed Patch Adapter checkpoint.")
-    
+
+    if getattr(args, "resume_meanflow", None) is not None and os.path.isfile(args.resume_meanflow):
+        logger.info(f"Resuming MeanFlow r_in from {args.resume_meanflow}")
+        ckpt = torch.load(args.resume_meanflow, map_location='cpu', weights_only=False)
+        load_meanflow_state_dict(model, ckpt["meanflow"], strict=False)
+        logger.info("Resumed MeanFlow r_in checkpoint.")
+
     if args.resume is not None and os.path.isfile(args.resume):
         logger.info(f"Resuming full model from {args.resume}")
         ckpt = torch.load(args.resume, map_location='cpu', weights_only=False)
@@ -1607,6 +1709,17 @@ if __name__ == "__main__":
                 # Surface a scalar for the rest of the loop's bookkeeping (loss logs, checkpoints).
                 loss = gen_loss_val if gen_loss_val is not None else avg_fake
                 input_t = []
+            elif meanflow_active:
+                loss, input_t = training_step_meanflow(
+                    latents,
+                    cond_latents,
+                    model_engine,
+                    denoiser,
+                    args,
+                    model_kwargs=model_kwargs,
+                    partial_cond=partial_cond,
+                    partial_mask=partial_mask,
+                )
             else:
                 loss, input_t = training_step(
                     latents,

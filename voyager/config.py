@@ -34,6 +34,7 @@ def parse_args(mode="eval", namespace=None):
     parser = add_step_sample_args(parser)
     parser = add_attn_map_args(parser)
     parser = add_dmd2_args(parser)
+    parser = add_meanflow_args(parser)
 
     if "eval_realestate10K" in mode:
         parser = add_realestate10K_eval_args(parser)
@@ -1081,6 +1082,21 @@ def add_meanflow_args(parser: argparse.ArgumentParser):
         type=str,
         default=None,
         help="Path to a MeanFlow r_in checkpoint (.pt) to resume from.",
+    )
+
+    # ----- inference -----
+    group.add_argument(
+        "--meanflow-steps",
+        type=int,
+        default=0,
+        help="Number of few-step MeanFlow sampling intervals at inference "
+             "(1 = single NFE). 0 disables the MeanFlow sampling path.",
+    )
+    group.add_argument(
+        "--meanflow-path",
+        type=str,
+        default=None,
+        help="Path to a trained MeanFlow r_in checkpoint (meanflow_last.pt) for inference.",
     )
     return parser
 

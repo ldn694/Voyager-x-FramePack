@@ -1181,3 +1181,165 @@ class HunyuanVideoSampler(Inference):
         logger.info(f"Success, time: {gen_time}")
 
         return out_dict
+
+    @torch.no_grad()
+    def predict_meanflow(
+        self,
+        prompt,
+        height=192,
+        width=336,
+        video_length=49,
+        seed=0,
+        negative_prompt=None,
+        flow_shift=7.0,
+        embedded_guidance_scale=None,
+        num_steps=1,
+        i2v_condition_type="latent_concat",
+        ref_images=None,
+        partial_cond=None,
+        partial_mask=None,
+        **kwargs,
+    ):
+        """Few-step MeanFlow inference (standalone of the DMD2/teacher pipeline loop).
+
+        Reuses this sampler's conditioning prep (ref/partial VAE-encode, RoPE, prompt
+        encode) but replaces the scheduler denoise loop with ``meanflow_sample``: the
+        student conditions on two times ``u_theta(z, r, t)`` and steps
+        ``z_r = z_t - (t-r)*u`` from ``t=1`` (noise) to ``0`` (data). The model must
+        already carry the trained ``r_in`` (see ``apply_meanflow_to_hunyuan_video`` +
+        ``load_meanflow_state_dict`` in the calling script). No CFG (1-NFE student).
+        """
+        from voyager.diffusion.meanflow import make_meanflow_forward_u, meanflow_sample, has_meanflow
+
+        assert has_meanflow(self.model), \
+            "model has no r_in — apply_meanflow + load_meanflow_state_dict before calling predict_meanflow"
+        assert i2v_condition_type == "latent_concat", "MeanFlow inference supports latent_concat only"
+
+        out_dict = {}
+        if seed is None:
+            seed = random.randint(0, 1_000_000)
+        generator = torch.Generator(self.device).manual_seed(int(seed))
+
+        if (video_length - 1) % 4 != 0:
+            raise ValueError(f"`video_length-1` must be a multiple of 4, got {video_length}")
+
+        # Voyager stacks rgb over depth (+64 placeholder rows); target image is 2x+64 tall.
+        target_height = height * 2 + 64
+        target_width = width
+        target_video_length = video_length
+        closest_size = (height, width)
+
+        if negative_prompt is None or negative_prompt == "":
+            negative_prompt = self.default_negative_prompt
+
+        # ---- reference frame (first frame) -> latent ----
+        ref_images_pixel_values = [self.load_image(p, image_size=closest_size) for p in ref_images]
+        ref_images_pixel_values = torch.cat(ref_images_pixel_values).unsqueeze(0).unsqueeze(2).to(self.device)
+        ref_pil = [Image.fromarray(((torch.clamp(ref_images_pixel_values[0, :, 0].permute(1, 2, 0), min=-1, max=1).cpu().numpy() + 1) * 0.5 * 255).astype(np.uint8))]
+
+        # ---- partial conditions (rendered partial RGB-D + mask) ----
+        partial_cond = torch.stack([self.load_image(p, image_size=closest_size) for p in partial_cond], dim=1).unsqueeze(0).to(self.device)
+        partial_mask = torch.stack([self.load_image(p, image_size=closest_size) for p in partial_mask], dim=1).unsqueeze(0).to(self.device)
+
+        vae = self.pipeline.vae
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
+            vae.enable_tiling()
+            ref_latents = vae.encode(ref_images_pixel_values).latent_dist.sample()
+            ref_latents.mul_(vae.config.scaling_factor)
+            partial_cond = vae.encode(partial_cond).latent_dist.sample()
+            partial_cond.mul_(vae.config.scaling_factor)
+
+            # mask: invert, prepend 3 first-frames, maxpool to latent grid, invert back
+            mask_frames = 1 - partial_mask
+            first_mask = mask_frames[:, :, 0:1]
+            mask_frames = torch.cat([first_mask, first_mask, first_mask, mask_frames], dim=2)
+            mask_frames = torch.nn.functional.max_pool3d(mask_frames, kernel_size=(4, 8, 8), stride=(4, 8, 8))
+            mask_frames = 1 - mask_frames
+            partial_mask = mask_frames[:, 0:1]
+
+        target_dtype = PRECISION_TO_TYPE[self.args.precision]
+        ref_latents = ref_latents.to(target_dtype)
+        partial_cond = partial_cond.to(target_dtype)
+        partial_mask = partial_mask.to(target_dtype)
+
+        # ---- RoPE (standard backbone) ----
+        freqs_cos, freqs_sin = self.get_rotary_pos_embed(target_video_length, target_height, target_width)
+
+        # ---- text (no CFG for the 1-NFE student) ----
+        prompt_embeds, _, prompt_mask, _ = self.pipeline.encode_prompt(
+            [prompt.strip()], self.device, 1, False, [negative_prompt.strip()],
+            data_type="video", semantic_images=ref_pil,
+        )
+        prompt_embeds_2 = None
+        if self.pipeline.text_encoder_2 is not None:
+            prompt_embeds_2, _, _, _ = self.pipeline.encode_prompt(
+                [prompt.strip()], self.device, 1, False, [negative_prompt.strip()],
+                text_encoder=self.pipeline.text_encoder_2, data_type="video",
+            )
+        model_kwargs = dict(
+            text_states=prompt_embeds.to(target_dtype),
+            text_mask=prompt_mask,
+            text_states_2=prompt_embeds_2.to(target_dtype) if prompt_embeds_2 is not None else None,
+            freqs_cos=freqs_cos.to(self.device),
+            freqs_sin=freqs_sin.to(self.device),
+        )
+
+        # ---- init noise z at t=1 (z_1 = eps under rectified-flow reverse) ----
+        if "884" in self.args.vae:
+            t_lat = (target_video_length - 1) // 4 + 1
+        elif "888" in self.args.vae:
+            t_lat = (target_video_length - 1) // 8 + 1
+        else:
+            t_lat = target_video_length
+        latent_ch = int(self.model.out_channels)
+        z = torch.randn(
+            1, latent_ch, t_lat, target_height // 8, target_width // 8,
+            generator=generator, device=self.device, dtype=target_dtype,
+        )
+
+        guidance = None
+        if getattr(self.model, "guidance_embed", False) and embedded_guidance_scale is not None:
+            guidance = torch.tensor([embedded_guidance_scale], dtype=torch.float32, device=self.device).to(target_dtype) * 1000.0
+
+        forward_u = make_meanflow_forward_u(
+            self.model,
+            get_model_t=lambda tt: tt * 1000.0,
+            model_kwargs=model_kwargs,
+            cond_latents=ref_latents,
+            partial_cond=partial_cond,
+            partial_mask=partial_mask,
+            guidance=guidance,
+        )
+
+        start_time = time.time()
+        target_dtype_cast = (target_dtype != torch.float32) and not self.args.disable_autocast
+        with torch.autocast(device_type="cuda", dtype=target_dtype, enabled=target_dtype_cast):
+            x0 = meanflow_sample(z, forward_u, num_steps=num_steps)
+        logger.info(f"MeanFlow {num_steps}-step sampling done in {time.time() - start_time:.2f}s")
+
+        # ---- decode latents -> RGB-D video (mirrors pipeline tail) ----
+        vae_dtype = PRECISION_TO_TYPE[self.args.vae_precision]
+        if hasattr(vae.config, "shift_factor") and vae.config.shift_factor:
+            x0 = x0 / vae.config.scaling_factor + vae.config.shift_factor
+        else:
+            x0 = x0 / vae.config.scaling_factor
+        with torch.autocast(device_type="cuda", dtype=vae_dtype, enabled=vae_dtype != torch.float32):
+            vae.enable_tiling()
+            image = vae.decode(x0, return_dict=False, generator=generator)[0]
+        if image.shape[2] == 1:
+            image = image.squeeze(2)
+        image = (image / 2 + 0.5).clamp(0, 1).cpu().float()
+
+        half_height = (target_height - 64) // 2
+        rgb = image[..., :half_height, :]
+        depth = image[..., -half_height:, :]
+        depth = depth[:, 0] * 0.299 + depth[:, 1] * 0.587 + depth[:, 2] * 0.114
+        depth = depth.unsqueeze(1).repeat(1, 3, 1, 1, 1)
+        if len(rgb.shape) == 4:
+            rgb = rgb.unsqueeze(2)
+        image = torch.cat([rgb, depth], dim=-2)
+
+        out_dict["samples"] = image
+        out_dict["prompts"] = prompt
+        out_dict["seeds"] = [seed] * image.shape[0]
+        return out_dict

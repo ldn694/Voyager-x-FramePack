@@ -46,7 +46,7 @@ def meanflow_timesteps(num_steps: int) -> List[Tuple[float, float]]:
 
 def make_meanflow_forward_u(
     model,
-    denoiser,
+    get_model_t: Callable[[torch.Tensor], torch.Tensor],
     *,
     model_kwargs: dict,
     cond_latents: Optional[torch.Tensor] = None,
@@ -61,6 +61,10 @@ def make_meanflow_forward_u(
     ``u`` is the predicted average velocity over ``[r, t]`` in data-channel space.
     Uses ``model_forward_jvp`` with zero tangents (its primal == ``u_theta``) and
     injects the second-time embedding ``r_in(input_r)`` via ``extra_vec``.
+
+    ``get_model_t`` maps a flow-time tensor in ``[0,1]`` to the model's time input
+    (e.g. ``denoiser.get_model_t`` at train time, or ``lambda t: t * 1000`` at
+    inference) — keeps this decoupled from any specific scheduler/``Transport``.
     """
     assert i2v_condition_type == "latent_concat", "MeanFlow sampler supports latent_concat only"
     text_states = model_kwargs["text_states"]
@@ -83,8 +87,8 @@ def make_meanflow_forward_u(
             xt = torch.cat([xt, partial_cond, partial_mask], dim=1)
         xt = xt.to(model.dtype)
 
-        input_t = denoiser.get_model_t(t).to(z_data.device)
-        input_r = denoiser.get_model_t(r).to(z_data.device)
+        input_t = get_model_t(t).to(z_data.device)
+        input_r = get_model_t(r).to(z_data.device)
         extra_vec = model.r_in(input_r)
 
         u, _ = model_forward_jvp(
