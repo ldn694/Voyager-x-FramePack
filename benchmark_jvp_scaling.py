@@ -150,11 +150,15 @@ def _cleanup(model):
     torch.cuda.empty_cache()
 
 
-def time_primal(model, inp, ckpt, dtype):
-    """Plain model.forward (builds the autograd graph, no functorch)."""
+def _mean(xs):
+    return sum(xs) / len(xs) if xs else float("nan")
+
+
+def time_primal(model, inp, ckpt, dtype, iters=3):
+    """Plain model.forward. One warmup (absorbs Triton/cuDNN autotune), then
+    `iters` timed forwards averaged."""
     model.train()
     model.gradient_checkpoint = ckpt
-    torch.cuda.reset_peak_memory_stats()
 
     def fwd():
         with torch.autocast("cuda", dtype=dtype, enabled=(dtype != torch.float32)):
@@ -167,18 +171,25 @@ def time_primal(model, inp, ckpt, dtype):
             )
         return out[0] if isinstance(out, (tuple, list)) else out
 
-    fwd()  # warmup (triton/cudnn autotune for this shape)
-    _sync(); t0 = time.perf_counter()
-    out = fwd()
-    _sync(); fwd_ms = (time.perf_counter() - t0) * 1e3
-    peak = torch.cuda.max_memory_allocated() / 1e9
-    del out
+    fwd()  # warmup (autotune for this shape)
     _cleanup(model)
-    return fwd_ms, peak
+
+    torch.cuda.reset_peak_memory_stats()
+    fwd_times = []
+    for _ in range(iters):
+        _sync(); t0 = time.perf_counter()
+        out = fwd()
+        _sync(); fwd_times.append((time.perf_counter() - t0) * 1e3)
+        del out
+    peak = torch.cuda.max_memory_allocated() / 1e9
+    _cleanup(model)
+    return _mean(fwd_times), peak
 
 
-def time_jvp(model, inp, ckpt, dtype):
-    """model_forward_jvp forward, then backward on a dummy loss."""
+def time_jvp(model, inp, ckpt, dtype, iters=3):
+    """model_forward_jvp forward (+ backward on a dummy loss). One warmup
+    (absorbs autotune + first-call functorch tracing), then `iters` timed
+    fwd / bwd passes averaged separately."""
     model.train()
     model.gradient_checkpoint = ckpt
 
@@ -195,29 +206,33 @@ def time_jvp(model, inp, ckpt, dtype):
             )
         return u, dudt
 
-    # warmup (autotune + any first-call functorch tracing)
+    # warmup: full fwd (+bwd) so both forward and backward kernels autotune
     u, _ = fwd()
-    if u.requires_grad:
+    has_grad = u.requires_grad  # False under --freeze-backbone -> forward-only
+    if has_grad:
         ((u.float() ** 2).mean()).backward()
+    del u
     _cleanup(model)
 
     torch.cuda.reset_peak_memory_stats()
-    _sync(); t0 = time.perf_counter()
-    u, _ = fwd()
-    _sync(); fwd_ms = (time.perf_counter() - t0) * 1e3
+    fwd_times, bwd_times = [], []
+    for _ in range(iters):
+        _sync(); t0 = time.perf_counter()
+        u, _ = fwd()
+        _sync(); fwd_times.append((time.perf_counter() - t0) * 1e3)
 
-    bwd_ms = float("nan")
-    if u.requires_grad:  # frozen backbone -> no graph -> forward-only lower bound
-        loss = (u.float() ** 2).mean()
-        _sync(); t1 = time.perf_counter()
-        loss.backward()
-        _sync(); bwd_ms = (time.perf_counter() - t1) * 1e3
-        del loss
+        if has_grad:
+            loss = (u.float() ** 2).mean()
+            _sync(); t1 = time.perf_counter()
+            loss.backward()
+            _sync(); bwd_times.append((time.perf_counter() - t1) * 1e3)
+            del loss
+        del u
+        model.zero_grad(set_to_none=True)
     peak = torch.cuda.max_memory_allocated() / 1e9
 
-    del u
     _cleanup(model)
-    return fwd_ms, bwd_ms, peak
+    return _mean(fwd_times), _mean(bwd_times), peak
 
 
 # ---- sweep definitions: (label, hidden, heads, n_double, n_single, T, H, W) ----
@@ -259,6 +274,9 @@ def main():
                          "no gradient buffers, no retained graph. The lower-bound sanity check; "
                          "applied on top of --adapter. Forces gradient-checkpoint off (no backward).")
     ap.add_argument("--dtype", default="bf16", choices=list(_DTYPES))
+    ap.add_argument("--iters", type=int, default=3,
+                    help="timed iterations averaged per measurement (after 1 untimed warmup "
+                         "that absorbs Triton/cuDNN autotune)")
     ap.add_argument("--batch", type=int, default=1)
     ap.add_argument("--txt-len", type=int, default=256)
     ap.add_argument("--in-ch", type=int, default=50,
@@ -276,6 +294,7 @@ def main():
 
     gpu = torch.cuda.get_device_properties(0)
     print(f"# GPU: {gpu.name}  {gpu.total_memory/1e9:.1f} GB | dtype={args.dtype} | sweep={args.sweep}")
+    print(f"# timings = mean of {args.iters} iters after 1 warmup (ms)")
     print(f"# patch={patch} batch={args.batch} txt_len={args.txt_len} | adapter={args.adapter}"
           + (f" rank={args.lora_rank}" if args.adapter == "lora" else "")
           + (" | FREEZE-BACKBONE (forward-only lower bound)" if args.freeze_backbone else ""))
@@ -317,8 +336,8 @@ def main():
             primal_ms = float("nan")
             try:
                 if not args.no_primal:
-                    primal_ms, _ = time_primal(model, inp, ckpt, dtype)
-                jvp_fwd, jvp_bwd, peak = time_jvp(model, inp, ckpt, dtype)
+                    primal_ms, _ = time_primal(model, inp, ckpt, dtype, iters=args.iters)
+                jvp_fwd, jvp_bwd, peak = time_jvp(model, inp, ckpt, dtype, iters=args.iters)
                 ratio = jvp_fwd / primal_ms if primal_ms == primal_ms and primal_ms > 0 else float("nan")
                 row = [label, "ckpt" if ckpt else "no", inp["tokens"], blocks,
                        f"{primal_ms:.1f}", f"{jvp_fwd:.1f}", f"{ratio:.2f}",
