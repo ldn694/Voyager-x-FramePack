@@ -165,20 +165,42 @@ def meanflow_training_losses(
             * 1000.0
         )
 
-    # ---- JVP forward: u = u_theta(z, r, t), dudt = d/d(flow t) u (detached) ----
-    u, dudt = model_forward_jvp(
-        model,
-        (xt_full, t_x),
-        (input_t, t_t),
-        text_states=model_kwargs["text_states"],
-        text_mask=model_kwargs["text_mask"],
-        text_states_2=model_kwargs["text_states_2"],
-        freqs_cos=model_kwargs["freqs_cos"],
-        freqs_sin=model_kwargs["freqs_sin"],
-        guidance=guidance,
-        extra_vec=extra_vec,
-        attn_op=attn_op,
-    )
+    # ---- forward: u = u_theta(z, r, t), dudt = d/d(flow t) u (detached) ----
+    # When the whole batch has r == t the MeanFlow identity collapses to plain
+    # flow-matching (the `(t-r)*dudt` term vanishes), so the expensive JVP tangent
+    # pass would be computed and multiplied by zero. Take a plain forward instead
+    # (~3-4x cheaper). `extra_vec` still injects the r-embedding so r_in keeps its
+    # gradient and the primal `u` is identical to the JVP primal. Mixed batches
+    # (some r==t, some r!=t) still go through the JVP path.
+    used_jvp = not bool(flow_mask.all())
+    if used_jvp:
+        u, dudt = model_forward_jvp(
+            model,
+            (xt_full, t_x),
+            (input_t, t_t),
+            text_states=model_kwargs["text_states"],
+            text_mask=model_kwargs["text_mask"],
+            text_states_2=model_kwargs["text_states_2"],
+            freqs_cos=model_kwargs["freqs_cos"],
+            freqs_sin=model_kwargs["freqs_sin"],
+            guidance=guidance,
+            extra_vec=extra_vec,
+            attn_op=attn_op,
+        )
+    else:
+        u = model(
+            xt_full,
+            input_t,
+            text_states=model_kwargs["text_states"],
+            text_mask=model_kwargs["text_mask"],
+            text_states_2=model_kwargs["text_states_2"],
+            freqs_cos=model_kwargs["freqs_cos"],
+            freqs_sin=model_kwargs["freqs_sin"],
+            guidance=guidance,
+            extra_vec=extra_vec,
+            return_dict=False,
+        )
+        dudt = torch.zeros_like(u)  # t_minus_r == 0 below, so this is never read
     assert u.shape == v.shape, f"MeanFlow output {u.shape} must match velocity {v.shape}"
 
     # ---- MeanFlow identity target (flow-time t, r) ----
@@ -196,6 +218,7 @@ def meanflow_training_losses(
     terms = {
         "loss": loss,
         "mse": loss_per.detach(),  # raw (unweighted) per-sample MSE -> overfit signal
+        "used_jvp": used_jvp,      # False -> r==t fast path (plain fwd, no JVP)
         "input_t": input_t.detach().cpu().tolist(),
         "input_r": input_r.detach().cpu().tolist(),
         "r_eq_t_frac": float(flow_mask.float().mean().item()),

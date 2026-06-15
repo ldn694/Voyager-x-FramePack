@@ -101,6 +101,36 @@ class MockModel(nn.Module):
         x = torch.einsum("nthwcopq->nctohpwq", x)
         return x.reshape(x.shape[0], c, t * pt, h * ph, w * pw)
 
+    def forward(self, x, t, text_states=None, text_mask=None, text_states_2=None,
+                freqs_cos=None, freqs_sin=None, guidance=None, extra_vec=None,
+                return_dict=True, **kwargs):
+        """Primal-only forward mirroring the `ref` path used to validate the JVP.
+
+        Lets the MeanFlow r==t fast path (`model(..., extra_vec=...)`) run against
+        the mock; the result is identical to `model_forward_jvp`'s primal output.
+        """
+        _, _, ot, oh, ow = x.shape
+        pt, ph, pw = self.patch_size
+        tt, th, tw = ot // pt, oh // ph, ow // pw
+        vec = self.time_in(t) + self.vector_in(text_states_2)
+        if extra_vec is not None:
+            vec = vec + extra_vec
+        img = self.img_in(x)
+        img_seq = img.shape[1]
+        txt = self.txt_in(text_states)
+        text_len = int(text_mask[0].sum().item()) if text_mask is not None else txt.shape[1]
+        txt = txt[:, :text_len]
+        freqs = (freqs_cos, freqs_sin)
+        im, tx = img, txt
+        for blk in self.double_blocks:
+            im, tx = blk.ref_forward(im, tx, vec, freqs)
+        xx = torch.cat((im, tx), 1)
+        for blk in self.single_blocks:
+            xx = blk.ref_forward(xx, vec, text_len, freqs)
+        img_f = xx[:, :img_seq]
+        out = self.unpatchify(self.final_layer(img_f, vec), tt, th, tw)
+        return {"x": out} if return_dict else out
+
 
 def test_model_forward_jvp(dtype=torch.float64):
     torch.manual_seed(0)

@@ -334,8 +334,10 @@ def training_step_meanflow(
 
     loss = terms["loss"].mean()
     raw_mse = terms["mse"].mean().item()
+    r_eq_t_frac = terms["r_eq_t_frac"]
+    mode = "flow(r==t)" if not terms["used_jvp"] else "mean(r!=t)"
     logger.info(
-        f"MeanFlow loss: {loss.item()} (raw MSE {raw_mse:.6f}, r==t frac {terms['r_eq_t_frac']:.2f}) "
+        f"MeanFlow loss: {loss.item()} (raw MSE {raw_mse:.6f}, {mode}, r==t frac {r_eq_t_frac:.2f}) "
         f"in {time.time() - start_training_time:.2f}s, starting backward..."
     )
 
@@ -344,7 +346,7 @@ def training_step_meanflow(
     model_engine.step()
     logger.info(f"Completed backward + step in {time.time() - backward_start_time:.2f}s.")
 
-    return loss.item(), raw_mse, terms["input_t"]
+    return loss.item(), raw_mse, terms["used_jvp"], terms["input_t"]
 
 
 def load_rgbs_depths(rgbs, depths, placeholder_row_length):
@@ -1385,7 +1387,12 @@ if __name__ == "__main__":
     avg_loss_values = []
     start_time = time.time()
     running_loss = 0.0
-    running_mse = 0.0  # MeanFlow: raw (unweighted) MSE -> overfit signal
+    # MeanFlow: raw (unweighted) MSE split by objective (r==t flow-matching vs
+    # r!=t mean-velocity) — the two have different scales, so track separately.
+    running_mse_flow = 0.0
+    running_mse_mean = 0.0
+    count_mse_flow = 0
+    count_mse_mean = 0
     running_fake_loss = 0.0
     running_gen_loss = 0.0
     running_gen_count = 0
@@ -1712,7 +1719,7 @@ if __name__ == "__main__":
                 loss = gen_loss_val if gen_loss_val is not None else avg_fake
                 input_t = []
             elif meanflow_active:
-                loss, raw_mse, input_t = training_step_meanflow(
+                loss, raw_mse, used_jvp, input_t = training_step_meanflow(
                     latents,
                     cond_latents,
                     model_engine,
@@ -1743,7 +1750,12 @@ if __name__ == "__main__":
             if model_engine.global_rank == 0:
                 running_loss += loss
                 if meanflow_active:
-                    running_mse += raw_mse
+                    if used_jvp:  # r!=t -> mean-velocity objective
+                        running_mse_mean += raw_mse
+                        count_mse_mean += 1
+                    else:         # r==t -> plain flow-matching objective
+                        running_mse_flow += raw_mse
+                        count_mse_flow += 1
                 if dmd2_active:
                     running_fake_loss += avg_fake
                     running_fake_tp += avg_fake_t_p
@@ -1824,7 +1836,10 @@ if __name__ == "__main__":
                         'time': datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
                     }
                     if meanflow_active:
-                        avg_entry['avg_mse'] = running_mse / steps_per_update
+                        if count_mse_flow > 0:
+                            avg_entry['avg_mse_flow'] = running_mse_flow / count_mse_flow
+                        if count_mse_mean > 0:
+                            avg_entry['avg_mse_mean'] = running_mse_mean / count_mse_mean
                     if dmd2_active:
                         avg_entry['avg_fake_loss'] = running_fake_loss / steps_per_update
                         avg_entry['avg_fake_tp_mean'] = running_fake_tp / steps_per_update
@@ -1864,7 +1879,10 @@ if __name__ == "__main__":
 
                     log_msg = f"[Update {(global_step + 1) // steps_per_update}] avg_loss = {avg_loss:.4f}"
                     if meanflow_active:
-                        log_msg += f" | avg_mse = {avg_entry['avg_mse']:.6f}"
+                        if 'avg_mse_flow' in avg_entry:
+                            log_msg += f" | avg_mse_flow = {avg_entry['avg_mse_flow']:.6f}"
+                        if 'avg_mse_mean' in avg_entry:
+                            log_msg += f" | avg_mse_mean = {avg_entry['avg_mse_mean']:.6f}"
                     if dmd2_active:
                         log_msg += f" | avg_fake_loss = {avg_entry['avg_fake_loss']:.4f}"
                         if 'avg_gen_loss' in avg_entry:
@@ -1872,7 +1890,10 @@ if __name__ == "__main__":
                     logger.info(log_msg)
 
                     running_loss = 0.0
-                    running_mse = 0.0
+                    running_mse_flow = 0.0
+                    running_mse_mean = 0.0
+                    count_mse_flow = 0
+                    count_mse_mean = 0
                     running_fake_loss = 0.0
                     running_gen_loss = 0.0
                     running_gen_count = 0
@@ -1915,16 +1936,22 @@ if __name__ == "__main__":
 
                     # MeanFlow: raw (unweighted) MSE — the real overfit signal,
                     # plotted separately on a log axis since it heads toward ~c (1e-3)
-                    # while the weighted loss above saturates near 1.
+                    # while the weighted loss above saturates near 1. Split into the
+                    # two objectives (r==t flow-matching vs r!=t mean-velocity), which
+                    # live at different scales and must be read as separate curves.
                     if meanflow_active:
-                        mse_pairs = [(v['step'], v['avg_mse']) for v in avg_loss_values if 'avg_mse' in v]
-                        if mse_pairs:
+                        flow_pairs = [(v['step'], v['avg_mse_flow']) for v in avg_loss_values if 'avg_mse_flow' in v]
+                        mean_pairs = [(v['step'], v['avg_mse_mean']) for v in avg_loss_values if 'avg_mse_mean' in v]
+                        if flow_pairs or mean_pairs:
                             plt.figure()
-                            plt.plot([s for s, _ in mse_pairs], [m for _, m in mse_pairs], label='raw_mse')
+                            if flow_pairs:
+                                plt.plot([s for s, _ in flow_pairs], [m for _, m in flow_pairs], label='raw_mse_flow (r==t)')
+                            if mean_pairs:
+                                plt.plot([s for s, _ in mean_pairs], [m for _, m in mean_pairs], label='raw_mse_mean (r!=t)')
                             plt.xlabel('Step')
                             plt.ylabel('Avg raw MSE')
                             plt.yscale('log')
-                            plt.title('MeanFlow raw (unweighted) MSE')
+                            plt.title('MeanFlow raw (unweighted) MSE by objective')
                             plt.legend()
                             plt.savefig(Path(training_output_dir) / 'raw_mse_curve.png')
                             plt.close()

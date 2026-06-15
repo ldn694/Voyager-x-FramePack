@@ -1177,6 +1177,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         use_default_only: bool = False,
         freqs_cos_full: Optional[torch.Tensor] = None,
         freqs_sin_full: Optional[torch.Tensor] = None,
+        extra_vec: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         logger.debug(f"{x.shape=} {x.min()=} {x.max()=} {x.mean()=}")
         logger.debug(f"latent {x[:, :16, :, :, :].shape=} {x[:, :16, :, :, :].min()=} {x[:, :16, :, :, :].max()=} {x[:, :16, :, :, :].mean()=}")
@@ -1233,6 +1234,12 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
 
             # our timestep_embedding is merged into guidance_in(TimestepEmbedder)
             vec = vec + self.guidance_in(guidance)
+
+        # MeanFlow second-time (r) embedding: constant additive modulation term
+        # (mirrors model_forward_jvp's `extra_vec`). Default None -> no-op for all
+        # existing callers. Lets the r==t fast path reuse the real forward.
+        if extra_vec is not None:
+            vec = vec + extra_vec
 
         # Embed image, condition and text.
         if self.use_context_block:
