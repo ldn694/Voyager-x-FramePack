@@ -42,9 +42,52 @@ second/dual branch); ``i2v_condition_type != "token_replace"``.
 from typing import Callable, Optional, Tuple
 
 import torch
+import torch.utils.checkpoint
 
 from .jvp_attention import attention_withT, TensorWithT
 from .jvp_blocks import double_stream_block_jvp, single_stream_block_jvp
+
+
+def _double_block_ckpt(
+    block, img_wT, txt_wT, vec_wT, freqs_cis, condition_type, attn_op,
+) -> Tuple[TensorWithT, TensorWithT]:
+    """``double_stream_block_jvp`` under gradient checkpointing.
+
+    ``torch.utils.checkpoint`` only saves/recomputes plain tensor args, so the
+    ``(value, tangent)`` pairs are flattened to six tensors and the static args
+    (block, RoPE freqs, condition type, attn op) are captured by closure. The
+    block's primal output keeps its autograd graph (recomputed in backward); the
+    tangents stay detached, exactly as in the non-checkpointed path.
+    """
+    def run(img, t_img, txt, t_txt, vec, t_vec):
+        (o_img, t_o_img), (o_txt, t_o_txt) = double_stream_block_jvp(
+            block, (img, t_img), (txt, t_txt), (vec, t_vec),
+            freqs_cis=freqs_cis, condition_type=condition_type, attn_op=attn_op,
+        )
+        return o_img, t_o_img, o_txt, t_o_txt
+
+    o_img, t_o_img, o_txt, t_o_txt = torch.utils.checkpoint.checkpoint(
+        run, img_wT[0], img_wT[1], txt_wT[0], txt_wT[1], vec_wT[0], vec_wT[1],
+        use_reentrant=False,
+    )
+    return (o_img, t_o_img), (o_txt, t_o_txt)
+
+
+def _single_block_ckpt(
+    block, x_wT, vec_wT, txt_len, freqs_cis, condition_type, attn_op,
+) -> TensorWithT:
+    """``single_stream_block_jvp`` under gradient checkpointing (see ``_double_block_ckpt``)."""
+    def run(x, t_x, vec, t_vec):
+        o_x, t_o_x = single_stream_block_jvp(
+            block, (x, t_x), (vec, t_vec), txt_len=txt_len,
+            freqs_cis=freqs_cis, condition_type=condition_type, attn_op=attn_op,
+        )
+        return o_x, t_o_x
+
+    o_x, t_o_x = torch.utils.checkpoint.checkpoint(
+        run, x_wT[0], x_wT[1], vec_wT[0], vec_wT[1], use_reentrant=False,
+    )
+    return o_x, t_o_x
 
 
 def model_forward_jvp(
@@ -111,27 +154,47 @@ def model_forward_jvp(
     t_txt = torch.zeros_like(txt)
 
     # ---- DiT blocks ----
+    # Gradient checkpointing mirrors models.py:forward — this standalone JVP path
+    # bypasses models.py, so the `--gradient-checkpoint` flag has to be honored
+    # here explicitly or the full 60-block activation graph is retained (OOM at
+    # train scale). Blocks are recomputed in backward; numerics are unchanged.
+    # Mock models in the CPU tests lack these attrs -> getattr defaults to off.
+    use_ckpt = bool(getattr(model, "training", False) and getattr(model, "gradient_checkpoint", False))
+    ckpt_layers = getattr(model, "gradient_checkpoint_layers", -1)
+    n_double = len(model.double_blocks)
+
     freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
     img_seq_len = img.shape[1]
     img_wT: TensorWithT = (img, t_img)
     txt_wT: TensorWithT = (txt, t_txt)
     vec_wT: TensorWithT = (vec, t_vec)
 
-    for block in model.double_blocks:
-        img_wT, txt_wT = double_stream_block_jvp(
-            block, img_wT, txt_wT, vec_wT,
-            freqs_cis=freqs_cis, condition_type=model.i2v_condition_type, attn_op=attn_op,
-        )
+    for layer_num, block in enumerate(model.double_blocks):
+        if use_ckpt and (ckpt_layers == -1 or layer_num < ckpt_layers):
+            img_wT, txt_wT = _double_block_ckpt(
+                block, img_wT, txt_wT, vec_wT, freqs_cis, model.i2v_condition_type, attn_op,
+            )
+        else:
+            img_wT, txt_wT = double_stream_block_jvp(
+                block, img_wT, txt_wT, vec_wT,
+                freqs_cis=freqs_cis, condition_type=model.i2v_condition_type, attn_op=attn_op,
+            )
 
     x_wT: TensorWithT = (
         torch.cat((img_wT[0], txt_wT[0]), dim=1),
         torch.cat((img_wT[1], txt_wT[1]), dim=1),
     )
-    for block in model.single_blocks:
-        x_wT = single_stream_block_jvp(
-            block, x_wT, vec_wT, txt_len=text_len,
-            freqs_cis=freqs_cis, condition_type=model.i2v_condition_type, attn_op=attn_op,
-        )
+    for layer_num, block in enumerate(model.single_blocks):
+        global_idx = n_double + layer_num
+        if use_ckpt and (ckpt_layers == -1 or global_idx < ckpt_layers):
+            x_wT = _single_block_ckpt(
+                block, x_wT, vec_wT, text_len, freqs_cis, model.i2v_condition_type, attn_op,
+            )
+        else:
+            x_wT = single_stream_block_jvp(
+                block, x_wT, vec_wT, txt_len=text_len,
+                freqs_cis=freqs_cis, condition_type=model.i2v_condition_type, attn_op=attn_op,
+            )
 
     img_final = x_wT[0][:, :img_seq_len]
     t_img_final = x_wT[1][:, :img_seq_len].detach()

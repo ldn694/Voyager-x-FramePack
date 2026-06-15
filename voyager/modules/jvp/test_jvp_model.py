@@ -166,6 +166,63 @@ def test_model_forward_jvp(dtype=torch.float64):
     print("test_model_forward_jvp: PASSED")
 
 
+def test_model_forward_jvp_gradient_checkpoint(dtype=torch.float64):
+    """Gradient checkpointing must not change numerics or grads.
+
+    Validates the one risky interaction the GPU path relies on:
+    ``torch.func.jvp`` running *inside* a non-reentrant
+    ``torch.utils.checkpoint`` recompute. Runs the model JVP with and without
+    checkpointing on identical inputs and asserts the primals, tangents, AND the
+    parameter gradients match — i.e. checkpointing is a pure memory optimization.
+    """
+    torch.manual_seed(0)
+    hidden, heads, in_ch, out_ch = 32, 4, 8, 4
+    patch = (1, 2, 2)
+    mock = MockModel(hidden, heads, in_ch, out_ch, patch).to(dtype)
+
+    B, T, H, W = 1, 2, 4, 4
+    x = torch.randn(B, in_ch, T, H, W, dtype=dtype)
+    t = torch.rand(B, dtype=dtype) * 1000
+    t_x = torch.randn_like(x); t_x[:, out_ch:] = 0.0
+    t_t = torch.ones_like(t)
+
+    text_dim, L_txt = 16, 6
+    text_states = torch.randn(B, L_txt, text_dim, dtype=dtype)
+    text_mask = torch.zeros(B, L_txt); text_mask[:, :4] = 1.0
+    text_states_2 = torch.randn(B, 12, dtype=dtype)
+
+    head_dim = hidden // heads
+    a = head_dim // 4
+    cos, sin = get_nd_rotary_pos_embed([a, a, head_dim - 2 * a], (T, H // patch[1], W // patch[2]), use_real=True)
+    cos, sin = cos.to(dtype), sin.to(dtype)
+
+    def run(use_ckpt):
+        mock.zero_grad(set_to_none=True)
+        mock.train()
+        mock.gradient_checkpoint = use_ckpt
+        mock.gradient_checkpoint_layers = -1   # checkpoint every block
+        out, tout = model_forward_jvp(
+            mock, (x, t_x), (t, t_t),
+            text_states=text_states, text_mask=text_mask, text_states_2=text_states_2,
+            freqs_cos=cos, freqs_sin=sin, attn_op=naive_attention_withT,
+        )
+        loss = ((out - tout.detach()) ** 2).mean()
+        loss.backward()
+        grads = {n: p.grad.detach().clone() for n, p in mock.named_parameters() if p.grad is not None}
+        return out.detach(), tout.detach(), grads
+
+    out0, tout0, grads0 = run(False)
+    out1, tout1, grads1 = run(True)
+
+    torch.testing.assert_close(out1, out0)
+    torch.testing.assert_close(tout1, tout0)
+    assert grads0.keys() == grads1.keys() and len(grads0) > 0, "grad coverage changed under checkpointing"
+    for name in grads0:
+        torch.testing.assert_close(grads1[name], grads0[name], msg=f"grad mismatch for {name}")
+    print("test_model_forward_jvp_gradient_checkpoint: PASSED")
+
+
 if __name__ == "__main__":
     test_model_forward_jvp()
+    test_model_forward_jvp_gradient_checkpoint()
     print("MODEL-LEVEL JVP CPU TEST PASSED")
