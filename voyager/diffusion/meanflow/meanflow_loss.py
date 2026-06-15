@@ -195,6 +195,7 @@ def meanflow_training_losses(
 
     terms = {
         "loss": loss,
+        "mse": loss_per.detach(),  # raw (unweighted) per-sample MSE -> overfit signal
         "input_t": input_t.detach().cpu().tolist(),
         "input_r": input_r.detach().cpu().tolist(),
         "r_eq_t_frac": float(flow_mask.float().mean().item()),
