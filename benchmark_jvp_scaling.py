@@ -37,11 +37,20 @@ the script catches them and keeps going.
 
 import argparse
 import gc
+import sys
 import time
 from types import SimpleNamespace
 from typing import Optional
 
 import torch
+
+# Quiet the backbone's per-forward DEBUG logging (keeps the table readable).
+try:
+    from loguru import logger as _loguru_logger
+    _loguru_logger.remove()
+    _loguru_logger.add(sys.stderr, level="INFO")
+except Exception:
+    pass
 
 from voyager.modules.models import HYVideoDiffusionTransformer
 from voyager.modules.posemb_layers import get_nd_rotary_pos_embed
@@ -94,6 +103,9 @@ def build_model(hidden, heads, n_double, n_single, in_ch, out_ch, patch, device,
         dtype=dtype,
         device=torch.device(device),
     )
+    # The constructor's factory_kwargs don't reach every submodule (e.g. final_layer
+    # stays on CPU/fp32), so place the whole model explicitly.
+    model.to(device=torch.device(device), dtype=dtype)
     model.eval()
     return model
 
