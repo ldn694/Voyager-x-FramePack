@@ -39,10 +39,16 @@ import argparse
 import gc
 import sys
 import time
+from datetime import datetime
 from types import SimpleNamespace
 from typing import Optional
 
 import torch
+
+
+def _log(msg):
+    """Timestamped line, flushed immediately for real-time terminal feedback."""
+    print(f"[{datetime.now():%H:%M:%S}] {msg}", flush=True)
 
 # Quiet the backbone's per-forward DEBUG logging (keeps the table readable).
 try:
@@ -154,9 +160,9 @@ def _mean(xs):
     return sum(xs) / len(xs) if xs else float("nan")
 
 
-def time_primal(model, inp, ckpt, dtype, iters=3):
+def time_primal(model, inp, ckpt, dtype, iters=3, tag=""):
     """Plain model.forward. One warmup (absorbs Triton/cuDNN autotune), then
-    `iters` timed forwards averaged."""
+    `iters` timed forwards. Each warmup/iter is logged on completion."""
     model.train()
     model.gradient_checkpoint = ckpt
 
@@ -171,25 +177,30 @@ def time_primal(model, inp, ckpt, dtype, iters=3):
             )
         return out[0] if isinstance(out, (tuple, list)) else out
 
-    fwd()  # warmup (autotune for this shape)
+    _log(f"{tag} | primal warmup (autotune)...")
+    _sync(); tw = time.perf_counter()
+    fwd()
+    _sync(); _log(f"{tag} | primal warmup done in {time.perf_counter() - tw:.1f}s")
     _cleanup(model)
 
     torch.cuda.reset_peak_memory_stats()
     fwd_times = []
-    for _ in range(iters):
+    for i in range(iters):
         _sync(); t0 = time.perf_counter()
         out = fwd()
-        _sync(); fwd_times.append((time.perf_counter() - t0) * 1e3)
+        _sync(); ms = (time.perf_counter() - t0) * 1e3
+        fwd_times.append(ms)
+        _log(f"{tag} | primal fwd iter {i+1}/{iters}: {ms:.1f} ms")
         del out
     peak = torch.cuda.max_memory_allocated() / 1e9
     _cleanup(model)
     return _mean(fwd_times), peak
 
 
-def time_jvp(model, inp, ckpt, dtype, iters=3):
+def time_jvp(model, inp, ckpt, dtype, iters=3, tag=""):
     """model_forward_jvp forward (+ backward on a dummy loss). One warmup
     (absorbs autotune + first-call functorch tracing), then `iters` timed
-    fwd / bwd passes averaged separately."""
+    fwd / bwd passes. Each warmup/iter is logged on completion."""
     model.train()
     model.gradient_checkpoint = ckpt
 
@@ -207,25 +218,32 @@ def time_jvp(model, inp, ckpt, dtype, iters=3):
         return u, dudt
 
     # warmup: full fwd (+bwd) so both forward and backward kernels autotune
+    _log(f"{tag} | jvp warmup (autotune + functorch trace)...")
+    _sync(); tw = time.perf_counter()
     u, _ = fwd()
     has_grad = u.requires_grad  # False under --freeze-backbone -> forward-only
     if has_grad:
         ((u.float() ** 2).mean()).backward()
+    _sync(); _log(f"{tag} | jvp warmup done in {time.perf_counter() - tw:.1f}s")
     del u
     _cleanup(model)
 
     torch.cuda.reset_peak_memory_stats()
     fwd_times, bwd_times = [], []
-    for _ in range(iters):
+    for i in range(iters):
         _sync(); t0 = time.perf_counter()
         u, _ = fwd()
-        _sync(); fwd_times.append((time.perf_counter() - t0) * 1e3)
+        _sync(); fms = (time.perf_counter() - t0) * 1e3
+        fwd_times.append(fms)
+        _log(f"{tag} | jvp fwd iter {i+1}/{iters}: {fms:.1f} ms")
 
         if has_grad:
             loss = (u.float() ** 2).mean()
             _sync(); t1 = time.perf_counter()
             loss.backward()
-            _sync(); bwd_times.append((time.perf_counter() - t1) * 1e3)
+            _sync(); bms = (time.perf_counter() - t1) * 1e3
+            bwd_times.append(bms)
+            _log(f"{tag} | jvp bwd iter {i+1}/{iters}: {bms:.1f} ms")
             del loss
         del u
         model.zero_grad(set_to_none=True)
@@ -334,10 +352,11 @@ def main():
 
         for ckpt in ckpt_settings:
             primal_ms = float("nan")
+            tag = f"{label} | {'ckpt' if ckpt else 'no'}"
             try:
                 if not args.no_primal:
-                    primal_ms, _ = time_primal(model, inp, ckpt, dtype, iters=args.iters)
-                jvp_fwd, jvp_bwd, peak = time_jvp(model, inp, ckpt, dtype, iters=args.iters)
+                    primal_ms, _ = time_primal(model, inp, ckpt, dtype, iters=args.iters, tag=tag)
+                jvp_fwd, jvp_bwd, peak = time_jvp(model, inp, ckpt, dtype, iters=args.iters, tag=tag)
                 ratio = jvp_fwd / primal_ms if primal_ms == primal_ms and primal_ms > 0 else float("nan")
                 row = [label, "ckpt" if ckpt else "no", inp["tokens"], blocks,
                        f"{primal_ms:.1f}", f"{jvp_fwd:.1f}", f"{ratio:.2f}",
