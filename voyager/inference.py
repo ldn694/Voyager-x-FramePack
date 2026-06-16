@@ -1242,6 +1242,8 @@ class HunyuanVideoSampler(Inference):
         partial_mask = torch.stack([self.load_image(p, image_size=closest_size) for p in partial_mask], dim=1).unsqueeze(0).to(self.device)
 
         vae = self.pipeline.vae
+        logger.info("MeanFlow: VAE-encoding ref + partial conditions (slow under --use-cpu-offload)...")
+        _t = time.time()
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
             vae.enable_tiling()
             ref_latents = vae.encode(ref_images_pixel_values).latent_dist.sample()
@@ -1256,6 +1258,7 @@ class HunyuanVideoSampler(Inference):
             mask_frames = torch.nn.functional.max_pool3d(mask_frames, kernel_size=(4, 8, 8), stride=(4, 8, 8))
             mask_frames = 1 - mask_frames
             partial_mask = mask_frames[:, 0:1]
+        logger.info(f"MeanFlow: VAE-encode done in {time.time() - _t:.2f}s")
 
         target_dtype = PRECISION_TO_TYPE[self.args.precision]
         ref_latents = ref_latents.to(target_dtype)
@@ -1266,6 +1269,8 @@ class HunyuanVideoSampler(Inference):
         freqs_cos, freqs_sin = self.get_rotary_pos_embed(target_video_length, target_height, target_width)
 
         # ---- text (no CFG for the 1-NFE student) ----
+        logger.info("MeanFlow: encoding prompt (LLaVA LLM + CLIP-L; slow under --use-cpu-offload)...")
+        _t = time.time()
         prompt_embeds, _, prompt_mask, _ = self.pipeline.encode_prompt(
             [prompt.strip()], self.device, 1, False, [negative_prompt.strip()],
             data_type="video", semantic_images=ref_pil,
@@ -1276,6 +1281,7 @@ class HunyuanVideoSampler(Inference):
                 [prompt.strip()], self.device, 1, False, [negative_prompt.strip()],
                 text_encoder=self.pipeline.text_encoder_2, data_type="video",
             )
+        logger.info(f"MeanFlow: prompt encode done in {time.time() - _t:.2f}s")
         model_kwargs = dict(
             text_states=prompt_embeds.to(target_dtype),
             text_mask=prompt_mask,
@@ -1311,6 +1317,7 @@ class HunyuanVideoSampler(Inference):
             guidance=guidance,
         )
 
+        logger.info(f"MeanFlow: running {num_steps}-step sampling (first model forward absorbs flash-attn/cuDNN autotune)...")
         start_time = time.time()
         target_dtype_cast = (target_dtype != torch.float32) and not self.args.disable_autocast
         with torch.autocast(device_type="cuda", dtype=target_dtype, enabled=target_dtype_cast):
@@ -1318,6 +1325,8 @@ class HunyuanVideoSampler(Inference):
         logger.info(f"MeanFlow {num_steps}-step sampling done in {time.time() - start_time:.2f}s")
 
         # ---- decode latents -> RGB-D video (mirrors pipeline tail) ----
+        logger.info("MeanFlow: VAE-decoding latents -> RGB-D video...")
+        _t = time.time()
         vae_dtype = PRECISION_TO_TYPE[self.args.vae_precision]
         if hasattr(vae.config, "shift_factor") and vae.config.shift_factor:
             x0 = x0 / vae.config.scaling_factor + vae.config.shift_factor
@@ -1326,6 +1335,7 @@ class HunyuanVideoSampler(Inference):
         with torch.autocast(device_type="cuda", dtype=vae_dtype, enabled=vae_dtype != torch.float32):
             vae.enable_tiling()
             image = vae.decode(x0, return_dict=False, generator=generator)[0]
+        logger.info(f"MeanFlow: VAE-decode done in {time.time() - _t:.2f}s")
         if image.shape[2] == 1:
             image = image.squeeze(2)
         image = (image / 2 + 0.5).clamp(0, 1).cpu().float()
