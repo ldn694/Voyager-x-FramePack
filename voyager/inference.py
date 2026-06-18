@@ -1315,13 +1315,14 @@ class HunyuanVideoSampler(Inference):
             partial_cond=partial_cond,
             partial_mask=partial_mask,
             guidance=guidance,
+            verbose=True,
         )
 
         logger.info(f"MeanFlow: running {num_steps}-step sampling (first model forward absorbs flash-attn/cuDNN autotune)...")
         start_time = time.time()
         target_dtype_cast = (target_dtype != torch.float32) and not self.args.disable_autocast
         with torch.autocast(device_type="cuda", dtype=target_dtype, enabled=target_dtype_cast):
-            x0 = meanflow_sample(z, forward_u, num_steps=num_steps)
+            x0 = meanflow_sample(z, forward_u, num_steps=num_steps, verbose=True)
         logger.info(f"MeanFlow {num_steps}-step sampling done in {time.time() - start_time:.2f}s")
 
         # ---- decode latents -> RGB-D video (mirrors pipeline tail) ----

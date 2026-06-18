@@ -39,10 +39,12 @@ no padding); standard backbone only (no MultiPatchEmbed, no context block, no
 second/dual branch); ``i2v_condition_type != "token_replace"``.
 """
 
+import time
 from typing import Callable, Optional, Tuple
 
 import torch
 import torch.utils.checkpoint
+from loguru import logger
 
 from .jvp_attention import attention_withT, TensorWithT
 from .jvp_blocks import double_stream_block_jvp, single_stream_block_jvp
@@ -102,6 +104,7 @@ def model_forward_jvp(
     guidance: Optional[torch.Tensor] = None,
     extra_vec: Optional[torch.Tensor] = None,
     attn_op: Callable[[TensorWithT, TensorWithT, TensorWithT], TensorWithT] = attention_withT,
+    verbose: bool = False,
 ) -> TensorWithT:
     """JVP of the standard Hunyuan DiT forward. Returns ``(out, t_out)``.
 
@@ -115,6 +118,24 @@ def model_forward_jvp(
     """
     x, t_x = x_withT
     t, t_t = t_withT
+
+    # --- optional progress/timing logs (gated; off in training/bench/tests) ---
+    # Under --use-cpu-offload each submodule is streamed CPU<->GPU just-in-time,
+    # so a per-block stamp reveals whether the cost is the PCIe streaming (every
+    # block ticks slowly) vs. a single stuck call. _last holds the previous stamp.
+    _t0 = [time.time()]
+    _last = [time.time()]
+
+    def _stamp(msg: str) -> None:
+        if not verbose:
+            return
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        now = time.time()
+        logger.info(f"[jvp] {msg} (+{now - _t0[0]:.2f}s total, Δ{now - _last[0]:.2f}s)")
+        _last[0] = now
+
+    _stamp("model_forward_jvp: entered")
 
     # --- scope guards: this path mirrors only the standard backbone ---
     assert x.shape[0] == 1, "model_forward_jvp currently supports batch size 1"
@@ -137,10 +158,12 @@ def model_forward_jvp(
     if extra_vec is not None:
         vec = vec + extra_vec                              # MeanFlow r-embedding (zero tangent)
     t_vec = t_vec.detach()
+    _stamp("time/vector/guidance modulation done")
 
     # ---- patchify the latent (tangent from x) ----
     img, t_img = torch.func.jvp(model.img_in, (x,), (t_x,))
     t_img = t_img.detach()
+    _stamp("patchify (img_in) done")
 
     # ---- text (constant condition, zero tangent; cropped to true length) ----
     if model.text_projection == "linear":
@@ -152,6 +175,7 @@ def model_forward_jvp(
     text_len = int(text_mask[0].sum().item()) if text_mask is not None else txt.shape[1]
     txt = txt[:, :text_len]
     t_txt = torch.zeros_like(txt)
+    _stamp(f"text refiner (txt_in) done; text_len={text_len}")
 
     # ---- DiT blocks ----
     # Gradient checkpointing mirrors models.py:forward — this standalone JVP path
@@ -169,6 +193,7 @@ def model_forward_jvp(
     txt_wT: TensorWithT = (txt, t_txt)
     vec_wT: TensorWithT = (vec, t_vec)
 
+    _stamp(f"entering {n_double} double blocks (use_ckpt={use_ckpt})")
     for layer_num, block in enumerate(model.double_blocks):
         if use_ckpt and (ckpt_layers == -1 or layer_num < ckpt_layers):
             img_wT, txt_wT = _double_block_ckpt(
@@ -179,11 +204,14 @@ def model_forward_jvp(
                 block, img_wT, txt_wT, vec_wT,
                 freqs_cis=freqs_cis, condition_type=model.i2v_condition_type, attn_op=attn_op,
             )
+        _stamp(f"double block {layer_num}/{n_double} done")
 
     x_wT: TensorWithT = (
         torch.cat((img_wT[0], txt_wT[0]), dim=1),
         torch.cat((img_wT[1], txt_wT[1]), dim=1),
     )
+    n_single = len(model.single_blocks)
+    _stamp(f"entering {n_single} single blocks")
     for layer_num, block in enumerate(model.single_blocks):
         global_idx = n_double + layer_num
         if use_ckpt and (ckpt_layers == -1 or global_idx < ckpt_layers):
@@ -195,6 +223,7 @@ def model_forward_jvp(
                 block, x_wT, vec_wT, txt_len=text_len,
                 freqs_cis=freqs_cis, condition_type=model.i2v_condition_type, attn_op=attn_op,
             )
+        _stamp(f"single block {layer_num}/{n_single} done")
 
     img_final = x_wT[0][:, :img_seq_len]
     t_img_final = x_wT[1][:, :img_seq_len].detach()
@@ -205,4 +234,5 @@ def model_forward_jvp(
         return model.unpatchify(out_, tt, th, tw)
 
     out, t_out = torch.func.jvp(_final, (img_final, vec), (t_img_final, t_vec))
+    _stamp("final layer + unpatchify done")
     return out, t_out.detach()

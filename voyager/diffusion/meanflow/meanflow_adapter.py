@@ -40,7 +40,8 @@ from ...modules.embed_layers import TimestepEmbedder
 _R_IN_ATTR = "r_in"
 
 
-def apply_meanflow_to_hunyuan_video(model, zero_init: bool = True):
+def 
+apply_meanflow_to_hunyuan_video(model, zero_init: bool = True):
     """Attach a second-time (``r``) embedder ``model.r_in`` mirroring ``time_in``.
 
     Args:
