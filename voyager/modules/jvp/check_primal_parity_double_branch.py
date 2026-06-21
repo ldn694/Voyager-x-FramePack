@@ -28,13 +28,21 @@ patch). The double-branch / multi-kernel / final-layer weights are random/zero-i
 make parity trivially 0==0).
 """
 
+import argparse
 import os
 from pathlib import Path
 
 import torch
 from loguru import logger
 
-from voyager.config import parse_args
+from voyager.config import (
+    add_network_args, add_extra_models_args, add_denoise_schedule_args,
+    add_i2v_args, add_lora_args, add_inference_args, add_parallel_args,
+    add_patch_adapter_args, add_multiple_kernel_args, add_double_branch_args,
+    add_step_sample_args, add_attn_map_args, add_dmd2_args, add_meanflow_args,
+    sanity_check_args,
+)
+from voyager.utils.helpers import as_list_of_3tuple
 from voyager.constants import PRECISION_TO_TYPE
 from voyager.modules import load_model
 from voyager.modules.models import HUNYUAN_VIDEO_CONFIG
@@ -43,6 +51,28 @@ from voyager.modules.double_branch import apply_double_branch_to_hunyuan_video, 
 from voyager.utils.train_utils import load_state_dict, build_rope
 from voyager.modules.jvp.jvp_attention import attention_withT
 from voyager.modules.jvp.jvp_model_double_branch import model_forward_jvp_double_branch
+
+
+def _parse_args():
+    """Eval-mode parser (config.parse_args's builder list) PLUS the training-only
+    multi-kernel flags, which live in deepspeed_train_render.py rather than any config
+    builder. This harness builds a training-style (multi-kernel + double-branch) model,
+    so it needs both surfaces."""
+    parser = argparse.ArgumentParser(description="dual-branch JVP primal-parity check")
+    for add in (
+        add_network_args, add_extra_models_args, add_denoise_schedule_args,
+        add_i2v_args, add_lora_args, add_inference_args, add_parallel_args,
+        add_patch_adapter_args, add_multiple_kernel_args, add_double_branch_args,
+        add_step_sample_args, add_attn_map_args, add_dmd2_args, add_meanflow_args,
+    ):
+        parser = add(parser)
+    parser.add_argument('--train-multiple-kernels', action='store_true')
+    parser.add_argument('--kernel-sizes', action='append', nargs='+', type=int)
+    parser.add_argument('--kernel-indices', action='append', nargs='+', type=int)
+    args = parser.parse_args()
+    args.kernel_sizes = as_list_of_3tuple(args.kernel_sizes) if args.kernel_sizes is not None else None
+    args = sanity_check_args(args)
+    return args
 
 
 def _resolve_double_branch_cfg(args):
@@ -95,7 +125,7 @@ def _build_double_branch_dit(args, device, dtype):
 
 @torch.no_grad()
 def main():
-    args = parse_args(mode="eval")
+    args = _parse_args()
     device = "cuda"
     dtype = PRECISION_TO_TYPE[args.precision]
 
