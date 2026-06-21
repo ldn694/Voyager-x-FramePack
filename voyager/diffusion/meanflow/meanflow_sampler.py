@@ -15,9 +15,16 @@ This module is decoupled from any specific pipeline (like ``dmd2_sample``): the
 denoising math lives in :func:`meanflow_sample`, which takes a ``forward_u`` closure
 that maps ``(z_data, t, r) -> u`` (handling latent_concat assembly, the ``r``
 embedding, and model-time scaling). :func:`make_meanflow_forward_u` builds that
-closure on top of the validated JVP path (``model_forward_jvp`` with zero tangents
-gives exactly the primal ``u_theta``; the constant ``r`` embedding is injected via
-``extra_vec``).
+closure.
+
+JVP is a TRAINING-only construct: it produces the ``d/dt u`` target term in the
+MeanFlow identity. At inference we only need the primal average velocity
+``u_theta(z, r, t)``, so by default the closure calls the standard
+``model.forward`` (the ``r`` embedding is injected via ``extra_vec=r_in(r)``,
+exactly as in training). The legacy JVP route (``model_forward_jvp`` with zero
+tangents — its primal also equals ``u_theta``) is still available behind
+``use_jvp=True``, but it costs ~2x FLOPs plus the custom JVP attention kernel for
+tangents that are immediately discarded, so it is not the default for sampling.
 
 Convention matches training (``ICPlan(reverse=True)``): ``z_t = (1-t)x + t*eps``,
 ``t=1`` → noise, ``t=0`` → data, velocity ``v = eps - x``.
@@ -65,13 +72,20 @@ def make_meanflow_forward_u(
     guidance: Optional[torch.Tensor] = None,
     i2v_condition_type: str = "latent_concat",
     attn_op: Callable[[TensorWithT, TensorWithT, TensorWithT], TensorWithT] = attention_withT,
+    use_jvp: bool = False,
     verbose: bool = False,
 ) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
     """Build a ``forward_u(z_data, t, r) -> u`` closure for :func:`meanflow_sample`.
 
     ``u`` is the predicted average velocity over ``[r, t]`` in data-channel space.
-    Uses ``model_forward_jvp`` with zero tangents (its primal == ``u_theta``) and
-    injects the second-time embedding ``r_in(input_r)`` via ``extra_vec``.
+    The second-time embedding ``r_in(input_r)`` is injected via ``extra_vec`` in both
+    paths (the model's only ``r`` dependence).
+
+    ``use_jvp`` selects how the primal ``u`` is computed:
+      * ``False`` (default, for inference): the standard ``model.forward`` — no
+        forward-mode AD, no JVP attention kernel.
+      * ``True``: the legacy ``model_forward_jvp`` with zero tangents (primal also
+        equals ``u_theta``). ~2x cost; kept only for parity/debugging.
 
     ``get_model_t`` maps a flow-time tensor in ``[0,1]`` to the model's time input
     (e.g. ``denoiser.get_model_t`` at train time, or ``lambda t: t * 1000`` at
@@ -107,19 +121,30 @@ def make_meanflow_forward_u(
         extra_vec = model.r_in(input_r)
 
         if verbose:
-            logger.info("[meanflow] _forward_u: entering model_forward_jvp (DiT forward)...")
+            logger.info(f"[meanflow] _forward_u: entering DiT forward (use_jvp={use_jvp})...")
             _t0 = _sync_now()
-        u, _ = model_forward_jvp(
-            model,
-            (xt, torch.zeros_like(xt)),
-            (input_t, torch.zeros_like(input_t)),
-            text_states=text_states, text_mask=text_mask, text_states_2=text_states_2,
-            freqs_cos=freqs_cos, freqs_sin=freqs_sin,
-            guidance=guidance, extra_vec=extra_vec, attn_op=attn_op,
-            verbose=verbose,
-        )
+        if use_jvp:
+            # Legacy path: forward-mode AD with zero tangents -> primal == u_theta.
+            u, _ = model_forward_jvp(
+                model,
+                (xt, torch.zeros_like(xt)),
+                (input_t, torch.zeros_like(input_t)),
+                text_states=text_states, text_mask=text_mask, text_states_2=text_states_2,
+                freqs_cos=freqs_cos, freqs_sin=freqs_sin,
+                guidance=guidance, extra_vec=extra_vec, attn_op=attn_op,
+                verbose=verbose,
+            )
+        else:
+            # Inference path: plain primal forward. `extra_vec=r_in(r)` carries the
+            # full r conditioning (models.py adds it to the modulation vector `vec`).
+            u = model(
+                xt, input_t,
+                text_states=text_states, text_mask=text_mask, text_states_2=text_states_2,
+                freqs_cos=freqs_cos, freqs_sin=freqs_sin,
+                guidance=guidance, extra_vec=extra_vec, return_dict=False,
+            )
         if verbose:
-            logger.info(f"[meanflow] _forward_u: model_forward_jvp done in {_sync_now() - _t0:.2f}s")
+            logger.info(f"[meanflow] _forward_u: DiT forward done in {_sync_now() - _t0:.2f}s")
         return u
 
     return _forward_u

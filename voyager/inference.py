@@ -1315,6 +1315,7 @@ class HunyuanVideoSampler(Inference):
             partial_cond=partial_cond,
             partial_mask=partial_mask,
             guidance=guidance,
+            use_jvp=False,  # inference needs only the primal u_theta; skip the JVP machinery
             verbose=True,
         )
 
