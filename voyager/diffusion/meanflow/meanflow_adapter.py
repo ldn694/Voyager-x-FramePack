@@ -38,21 +38,12 @@ from ...modules.activation_layers import get_activation_layer
 from ...modules.embed_layers import TimestepEmbedder
 
 _R_IN_ATTR = "r_in"
+_R_IN_SECOND_ATTR = "r_in_second_branch"
 
 
-def apply_meanflow_to_hunyuan_video(model, zero_init: bool = True):
-    """Attach a second-time (``r``) embedder ``model.r_in`` mirroring ``time_in``.
-
-    Args:
-        model: a ``HYVideoDiffusionTransformer`` instance.
-        zero_init: zero the output projection so ``r_in(r) == 0`` at init, keeping
-            the model identical to the pretrained single-time baseline.
-
-    Returns the (mutated) model. Idempotent: re-applying replaces ``r_in``.
-    """
-    ref = next(model.time_in.parameters())
+def _make_r_embedder(hidden_size, ref, zero_init: bool):
     r_in = TimestepEmbedder(
-        model.hidden_size,
+        hidden_size,
         get_activation_layer("silu"),
         dtype=ref.dtype,
         device=ref.device,
@@ -62,10 +53,35 @@ def apply_meanflow_to_hunyuan_video(model, zero_init: bool = True):
         # the whole module outputs 0 regardless of r.
         nn.init.zeros_(r_in.mlp[2].weight)
         nn.init.zeros_(r_in.mlp[2].bias)
-
-    setattr(model, _R_IN_ATTR, r_in)
     for p in r_in.parameters():
         p.requires_grad = True
+    return r_in
+
+
+def apply_meanflow_to_hunyuan_video(model, zero_init: bool = True):
+    """Attach a second-time (``r``) embedder ``model.r_in`` mirroring ``time_in``.
+
+    For a dual-branch model (``use_second_branch``) a matching
+    ``model.r_in_second_branch`` is also attached, mirroring
+    ``time_in_second_branch`` (second-branch width), so the ``r`` conditioning
+    reaches the second branch's modulation vector the same way ``t`` does. Both are
+    zero-initialised, so the freshly-applied model reproduces the pretrained
+    behaviour bit-for-bit.
+
+    Args:
+        model: a ``HYVideoDiffusionTransformer`` instance.
+        zero_init: zero the output projection so ``r_in(r) == 0`` at init.
+
+    Returns the (mutated) model. Idempotent: re-applying replaces the embedders.
+    """
+    ref = next(model.time_in.parameters())
+    setattr(model, _R_IN_ATTR, _make_r_embedder(model.hidden_size, ref, zero_init))
+
+    if getattr(model, "use_second_branch", False):
+        # second-branch width = proj_to_second_branch output dim
+        sb_hidden = model.proj_to_second_branch.out_features
+        sb_ref = next(model.time_in_second_branch.parameters())
+        setattr(model, _R_IN_SECOND_ATTR, _make_r_embedder(sb_hidden, sb_ref, zero_init))
     return model
 
 
@@ -73,33 +89,61 @@ def has_meanflow(model) -> bool:
     return getattr(model, _R_IN_ATTR, None) is not None
 
 
+def has_meanflow_second_branch(model) -> bool:
+    return getattr(model, _R_IN_SECOND_ATTR, None) is not None
+
+
+def _meanflow_modules(model) -> Dict[str, nn.Module]:
+    mods = {}
+    for attr in (_R_IN_ATTR, _R_IN_SECOND_ATTR):
+        m = getattr(model, attr, None)
+        if m is not None:
+            mods[attr] = m
+    return mods
+
+
 def get_meanflow_parameters(model) -> List[nn.Parameter]:
-    r_in = getattr(model, _R_IN_ATTR, None)
-    if r_in is None:
-        return []
-    return list(r_in.parameters())
+    params: List[nn.Parameter] = []
+    for m in _meanflow_modules(model).values():
+        params.extend(m.parameters())
+    return params
 
 
 def get_meanflow_state_dict(model) -> Dict[str, torch.Tensor]:
-    r_in = getattr(model, _R_IN_ATTR, None)
-    if r_in is None:
-        return {}
-    return {f"{_R_IN_ATTR}.{k}": v.detach().cpu() for k, v in r_in.state_dict().items()}
+    sd = {}
+    for attr, m in _meanflow_modules(model).items():
+        for k, v in m.state_dict().items():
+            sd[f"{attr}.{k}"] = v.detach().cpu()
+    return sd
 
 
 def load_meanflow_state_dict(model, state_dict: Dict[str, torch.Tensor], strict: bool = True):
-    """Restore ``r_in`` weights saved by :func:`get_meanflow_state_dict`.
+    """Restore the ``r_in`` (and ``r_in_second_branch``) weights.
 
-    Accepts keys either with or without the ``r_in.`` prefix.
+    Keys are grouped by their ``<attr>.`` prefix and loaded into the matching
+    module. A checkpoint without the second-branch keys is fine (it simply isn't
+    loaded); ``strict`` is applied per-module after grouping.
     """
-    r_in = getattr(model, _R_IN_ATTR, None)
-    if r_in is None:
+    mods = _meanflow_modules(model)
+    if not mods:
         raise RuntimeError("apply_meanflow_to_hunyuan_video must be called before loading r_in weights.")
-    prefix = f"{_R_IN_ATTR}."
-    cleaned = {
-        (k[len(prefix):] if k.startswith(prefix) else k): v
-        for k, v in state_dict.items()
-    }
-    ref = next(r_in.parameters())
-    cleaned = {k: v.to(device=ref.device, dtype=ref.dtype) for k, v in cleaned.items()}
-    return r_in.load_state_dict(cleaned, strict=strict)
+
+    grouped: Dict[str, Dict[str, torch.Tensor]] = {attr: {} for attr in mods}
+    # Longest-prefix match first so "r_in_second_branch." is not swallowed by "r_in.".
+    for k, v in state_dict.items():
+        for attr in sorted(mods, key=len, reverse=True):
+            prefix = f"{attr}."
+            if k.startswith(prefix):
+                grouped[attr][k[len(prefix):]] = v
+                break
+        else:
+            # un-prefixed keys default to the main r_in (back-compat with old ckpts)
+            grouped[_R_IN_ATTR][k] = v
+
+    for attr, m in mods.items():
+        sub = grouped[attr]
+        if not sub and attr == _R_IN_SECOND_ATTR:
+            continue  # second-branch embedder not present in this checkpoint
+        ref = next(m.parameters())
+        sub = {k: v.to(device=ref.device, dtype=ref.dtype) for k, v in sub.items()}
+        m.load_state_dict(sub, strict=strict)

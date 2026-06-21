@@ -48,7 +48,8 @@ import torch
 from ..flow.transport import SNRType
 from ...modules.jvp.jvp_attention import attention_withT, TensorWithT
 from ...modules.jvp.jvp_model import model_forward_jvp
-from .meanflow_adapter import has_meanflow
+from ...modules.jvp.jvp_model_double_branch import model_forward_jvp_double_branch
+from .meanflow_adapter import has_meanflow, has_meanflow_second_branch
 
 
 def _mean_flat(x: torch.Tensor) -> torch.Tensor:
@@ -156,6 +157,16 @@ def meanflow_training_losses(
     # r embedding (constant additive modulation term; zero tangent)
     extra_vec = model.r_in(input_r) if has_meanflow(model) else None
 
+    # dual-branch: r also conditions the second branch (separate width); the JVP
+    # forward and the real forward both take it as a constant additive modulation.
+    use_db = bool(getattr(model, "use_second_branch", False))
+    extra_vec_second = model.r_in_second_branch(input_r) if has_meanflow_second_branch(model) else None
+    indices = model_kwargs.get("indices") if use_db else None
+    db_tangent = getattr(args, "meanflow_db_tangent", "frozen")
+    if use_db:
+        assert indices is not None, \
+            "dual-branch MeanFlow needs multi-kernel `indices` in model_kwargs (--train-multiple-kernels)."
+
     # guidance modulation (cfg-distilled backbone), as in transport.training_losses
     guidance = None
     if getattr(model, "guidance_embed", False) and args.embedded_cfg_scale is not None:
@@ -174,19 +185,37 @@ def meanflow_training_losses(
     # (some r==t, some r!=t) still go through the JVP path.
     used_jvp = not bool(flow_mask.all())
     if used_jvp:
-        u, dudt = model_forward_jvp(
-            model,
-            (xt_full, t_x),
-            (input_t, t_t),
-            text_states=model_kwargs["text_states"],
-            text_mask=model_kwargs["text_mask"],
-            text_states_2=model_kwargs["text_states_2"],
-            freqs_cos=model_kwargs["freqs_cos"],
-            freqs_sin=model_kwargs["freqs_sin"],
-            guidance=guidance,
-            extra_vec=extra_vec,
-            attn_op=attn_op,
-        )
+        if use_db:
+            u, dudt = model_forward_jvp_double_branch(
+                model,
+                (xt_full, t_x),
+                (input_t, t_t),
+                text_states=model_kwargs["text_states"],
+                text_mask=model_kwargs["text_mask"],
+                text_states_2=model_kwargs["text_states_2"],
+                freqs_cos=model_kwargs["freqs_cos"],
+                freqs_sin=model_kwargs["freqs_sin"],
+                indices=indices,
+                guidance=guidance,
+                extra_vec=extra_vec,
+                extra_vec_second=extra_vec_second,
+                second_branch_tangent=db_tangent,
+                attn_op=attn_op,
+            )
+        else:
+            u, dudt = model_forward_jvp(
+                model,
+                (xt_full, t_x),
+                (input_t, t_t),
+                text_states=model_kwargs["text_states"],
+                text_mask=model_kwargs["text_mask"],
+                text_states_2=model_kwargs["text_states_2"],
+                freqs_cos=model_kwargs["freqs_cos"],
+                freqs_sin=model_kwargs["freqs_sin"],
+                guidance=guidance,
+                extra_vec=extra_vec,
+                attn_op=attn_op,
+            )
     else:
         u = model(
             xt_full,
@@ -198,6 +227,8 @@ def meanflow_training_losses(
             freqs_sin=model_kwargs["freqs_sin"],
             guidance=guidance,
             extra_vec=extra_vec,
+            extra_vec_second=extra_vec_second,
+            indices=indices,
             return_dict=False,
         )
         dudt = torch.zeros_like(u)  # t_minus_r == 0 below, so this is never read

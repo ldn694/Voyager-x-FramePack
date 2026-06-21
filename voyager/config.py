@@ -1083,6 +1083,16 @@ def add_meanflow_args(parser: argparse.ArgumentParser):
         default=None,
         help="Path to a MeanFlow r_in checkpoint (.pt) to resume from.",
     )
+    group.add_argument(
+        "--meanflow-db-tangent",
+        type=str,
+        default="frozen",
+        choices=["frozen", "full"],
+        help="Dual-branch JVP tangent mode (only used with --use-double-branch). "
+             "'frozen' (Option B): second branch + cross-attention contribute exact "
+             "primal but no tangent (cheap, recommended first). 'full' (Option A): "
+             "exact tangents through the second branch and cross-attention.",
+    )
 
     # ----- inference -----
     group.add_argument(

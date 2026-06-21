@@ -1178,6 +1178,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         freqs_cos_full: Optional[torch.Tensor] = None,
         freqs_sin_full: Optional[torch.Tensor] = None,
         extra_vec: Optional[torch.Tensor] = None,
+        extra_vec_second: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         logger.debug(f"{x.shape=} {x.min()=} {x.max()=} {x.mean()=}")
         logger.debug(f"latent {x[:, :16, :, :, :].shape=} {x[:, :16, :, :, :].min()=} {x[:, :16, :, :, :].max()=} {x[:, :16, :, :, :].mean()=}")
@@ -1271,6 +1272,11 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                 freqs_sin = freqs_sin[keyframe_mask[0].cpu()]
 
                 vec_second_branch = self.time_in_second_branch(t)
+                # MeanFlow second-time (r) embedding for the second branch (constant
+                # additive modulation term; mirrors `extra_vec` on the main `vec`).
+                # Default None -> no-op for all existing callers.
+                if extra_vec_second is not None:
+                    vec_second_branch = vec_second_branch + extra_vec_second
         else:
             if use_default_only and hasattr(self, "old_img_in"):
                 img = self.old_img_in(img)
