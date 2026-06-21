@@ -174,7 +174,8 @@ def model_forward_jvp_double_branch(
     last_img_wT: Optional[TensorWithT] = b1                 # (img1, t_img1)
     last_txt_wT: TensorWithT = (txt, t_txt)
     last_x_wT: Optional[TensorWithT] = None                 # cat(img,txt) once in single region
-    last_sb: torch.Tensor = b2[0]                           # second-branch primal (frozen: value only)
+    # project non-keyframe tokens into the second-branch width (mirrors models.py:1262)
+    last_sb: torch.Tensor = model.proj_to_second_branch(b2[0])   # primal (frozen tangent)
 
     for step in plan:
         # ---------------- first branch blocks ----------------
