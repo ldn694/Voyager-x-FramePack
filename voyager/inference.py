@@ -1265,8 +1265,41 @@ class HunyuanVideoSampler(Inference):
         partial_cond = partial_cond.to(target_dtype)
         partial_mask = partial_mask.to(target_dtype)
 
-        # ---- RoPE (standard backbone) ----
-        freqs_cos, freqs_sin = self.get_rotary_pos_embed(target_video_length, target_height, target_width)
+        # ---- RoPE ----
+        # Dual-branch / multi-kernel students need the per-kernel RoPE (mirrors `predict`);
+        # the standard backbone uses the single-kernel embedding. `indices` (the
+        # per-kernel frame-index groups) is threaded into the meanflow closure so
+        # model.forward runs its multi-kernel + double-branch path.
+        indices = None
+        if self.args.use_multiple_kernels:
+            logger.info("MeanFlow: using multiple kernels, computing per-kernel rotary embeddings.")
+            if "884" in self.args.vae:
+                latents_size = [(target_video_length - 1) // 4 + 1, target_height // 8, target_width // 8]
+            elif "888" in self.args.vae:
+                latents_size = [(target_video_length - 1) // 8 + 1, target_height // 8, target_width // 8]
+            else:
+                latents_size = [target_video_length, target_height // 8, target_width // 8]
+            target_ndim = 3
+            ndim = 5 - 2  # B, C, F, H, W -> F, H, W
+            scheduler = CompressionScheduler(
+                schedule_config={
+                    "patch_sizes": self.args.use_kernel_sizes if self.args.use_kernel_sizes is not None else self.model.patch_size,
+                }
+            )
+            indices = self.args.use_kernel_indices if self.args.use_kernel_indices is not None else [range(latents_size[0])]
+            freqs_cos, freqs_sin = scheduler.get_rope_freq(
+                indices,
+                self.args.rope_theta,
+                self.model.hidden_size // self.model.heads_num,
+                self.model.rope_dim_list,
+                latents_size,
+                ndim,
+                target_ndim,
+                rope_theta_rescale_factor=1.0,
+                rope_interpolation_factor=1.0,
+            )
+        else:
+            freqs_cos, freqs_sin = self.get_rotary_pos_embed(target_video_length, target_height, target_width)
 
         # ---- text (no CFG for the 1-NFE student) ----
         logger.info("MeanFlow: encoding prompt (LLaVA LLM + CLIP-L; slow under --use-cpu-offload)...")
@@ -1315,6 +1348,7 @@ class HunyuanVideoSampler(Inference):
             partial_cond=partial_cond,
             partial_mask=partial_mask,
             guidance=guidance,
+            indices=indices,  # per-kernel frame-index groups (None on standard backbone)
             use_jvp=False,  # inference needs only the primal u_theta; skip the JVP machinery
             verbose=True,
         )

@@ -70,6 +70,7 @@ def make_meanflow_forward_u(
     partial_cond: Optional[torch.Tensor] = None,
     partial_mask: Optional[torch.Tensor] = None,
     guidance: Optional[torch.Tensor] = None,
+    indices: Optional[List] = None,
     i2v_condition_type: str = "latent_concat",
     attn_op: Callable[[TensorWithT, TensorWithT, TensorWithT], TensorWithT] = attention_withT,
     use_jvp: bool = False,
@@ -81,17 +82,28 @@ def make_meanflow_forward_u(
     The second-time embedding ``r_in(input_r)`` is injected via ``extra_vec`` in both
     paths (the model's only ``r`` dependence).
 
+    For a dual-branch model (``r_in_second_branch`` attached by
+    ``apply_meanflow_to_hunyuan_video``) the closure additionally injects
+    ``extra_vec_second=r_in_second_branch(input_r)`` and passes ``indices`` (the
+    per-kernel frame-index groups, i.e. ``args.use_kernel_indices``) so the standard
+    ``model.forward`` runs its multi-kernel + double-branch path. Both extra args are
+    ``None`` on the standard backbone, so that path is unchanged.
+
     ``use_jvp`` selects how the primal ``u`` is computed:
       * ``False`` (default, for inference): the standard ``model.forward`` — no
-        forward-mode AD, no JVP attention kernel.
+        forward-mode AD, no JVP attention kernel. Supports dual-branch.
       * ``True``: the legacy ``model_forward_jvp`` with zero tangents (primal also
-        equals ``u_theta``). ~2x cost; kept only for parity/debugging.
+        equals ``u_theta``). ~2x cost; kept only for parity/debugging. Standard
+        backbone only.
 
     ``get_model_t`` maps a flow-time tensor in ``[0,1]`` to the model's time input
     (e.g. ``denoiser.get_model_t`` at train time, or ``lambda t: t * 1000`` at
     inference) — keeps this decoupled from any specific scheduler/``Transport``.
     """
     assert i2v_condition_type == "latent_concat", "MeanFlow sampler supports latent_concat only"
+    use_second_branch = getattr(model, "r_in_second_branch", None) is not None
+    assert not (use_jvp and use_second_branch), \
+        "use_jvp=True is standard-backbone only; the dual-branch primal path is model.forward (use_jvp=False)."
     text_states = model_kwargs["text_states"]
     text_mask = model_kwargs["text_mask"]
     text_states_2 = model_kwargs["text_states_2"]
@@ -119,6 +131,9 @@ def make_meanflow_forward_u(
         if verbose:
             logger.info("[meanflow] _forward_u: computing r-embedding (model.r_in)...")
         extra_vec = model.r_in(input_r)
+        # Dual-branch: the second branch has its own r-embedder, summed into its own
+        # modulation vector (models.py:vec_second_branch). None on the standard backbone.
+        extra_vec_second = model.r_in_second_branch(input_r) if use_second_branch else None
 
         if verbose:
             logger.info(f"[meanflow] _forward_u: entering DiT forward (use_jvp={use_jvp})...")
@@ -141,7 +156,9 @@ def make_meanflow_forward_u(
                 xt, input_t,
                 text_states=text_states, text_mask=text_mask, text_states_2=text_states_2,
                 freqs_cos=freqs_cos, freqs_sin=freqs_sin,
-                guidance=guidance, extra_vec=extra_vec, return_dict=False,
+                guidance=guidance, extra_vec=extra_vec,
+                indices=indices, extra_vec_second=extra_vec_second,
+                return_dict=False,
             )
         if verbose:
             logger.info(f"[meanflow] _forward_u: DiT forward done in {_sync_now() - _t0:.2f}s")

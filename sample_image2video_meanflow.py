@@ -44,7 +44,14 @@ def main():
     save_path = args.save_path if args.save_path_suffix == "" else f"{args.save_path}_{args.save_path_suffix}"
     os.makedirs(save_path, exist_ok=True)
 
-    # Load base model (+ LoRA via --use-lora/--lora-path inside from_pretrained).
+    # Dual-branch students: pull the multi-kernel patch sizes off the trained
+    # multi_kernel ckpt's args (no CLI flag for them) so predict_meanflow can build
+    # the per-kernel RoPE. Mirrors sample_image2video_realestate10K.py.
+    if args.use_multiple_kernels and args.multiple_kernels_path:
+        multiple_kernels_ckpt = torch.load(args.multiple_kernels_path, map_location="cpu", weights_only=False)
+        args.use_kernel_sizes = multiple_kernels_ckpt["args"]["kernel_sizes"]
+
+    # Load base model (+ LoRA, multi-kernel, double-branch via flags inside from_pretrained).
     hunyuan_video_sampler = HunyuanVideoSampler.from_pretrained(models_root_path, args=args)
     args = hunyuan_video_sampler.args
     model = hunyuan_video_sampler.model
