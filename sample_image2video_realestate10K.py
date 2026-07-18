@@ -80,6 +80,8 @@ if __name__ == "__main__":
             seed=args.seed,
             negative_prompt=args.neg_prompt,
             infer_steps=args.infer_steps,
+            with_teacache=args.with_teacache,
+            teacache_thresh=args.teacache_thresh,
             guidance_scale=args.cfg_scale,
             num_videos_per_prompt=args.num_videos,
             flow_shift=args.flow_shift,
@@ -125,7 +127,9 @@ if __name__ == "__main__":
         final_metric = {
             'metrics': metrics,
             'avg_metric': avg_metric,
-            'time': single_test_time
+            'time': single_test_time,
+            # Actual model runs for this clip (== infer_steps when TeaCache off/None).
+            'num_model_inferences': outputs.get('num_model_inferences', args.infer_steps),
         }
         # Save metrics to json
         with open(os.path.join(save_path, f'{test_path}.json'), 'w') as f:

@@ -1194,6 +1194,11 @@ class HunyuanVideoSampler(Inference):
         out_dict["prompts"] = prompt
         out_dict["seeds"] = [seed] * len(out_dict["samples"]) # Or however your seeds are tracked
 
+        # Number of actual model runs this generation (TeaCache may skip some).
+        if with_teacache and hasattr(self.pipeline, "transformer"):
+            out_dict["num_model_inferences"] = getattr(
+                self.pipeline.transformer, "teacache_computed_steps", None)
+
         gen_time = time.time() - start_time
         logger.info(f"Success, time: {gen_time}")
 

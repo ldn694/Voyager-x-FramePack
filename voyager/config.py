@@ -626,6 +626,19 @@ def add_inference_args(parser: argparse.ArgumentParser):
              "cached steps = faster but lower fidelity. ~0.15 quality, ~0.25 fast.",
     )
     group.add_argument(
+        "--calib-glob",
+        type=str,
+        default=None,
+        help="calibrate_teacache.py: glob of case dirs to calibrate over "
+             "(overrides --input-path case discovery).",
+    )
+    group.add_argument(
+        "--calib-degree",
+        type=int,
+        default=4,
+        help="calibrate_teacache.py: polynomial degree for the TeaCache fit.",
+    )
+    group.add_argument(
         "--save-path",
         type=str,
         default="./results",

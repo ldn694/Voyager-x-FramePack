@@ -1158,19 +1158,28 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         self.teacache_accum = 0.0
         self.teacache_prev_modulated = None
         self.teacache_prev_residual = None
+        self.teacache_computed_steps = 0     # actual model runs this generation
         # Degree-4 poly1d rescale, official TeaCache HunyuanVideo coefficients.
         self.teacache_coefficients = [
             7.33226126e+02, -4.01131952e+02, 6.75869174e+01,
             -3.14987800e+00, 9.61237896e-02,
         ]
+        # Calibration mode: when True, never skip; instead record
+        # (input_rel_l1, residual_rel_l1) pairs into teacache_cal_data so a new
+        # polynomial can be fit offline. cal_data persists across clips.
+        self.teacache_calibrate = False
+        self.teacache_cal_data = []
+        self._teacache_pending_x = None
 
     def teacache_reset(self, num_steps: int):
-        """Reset TeaCache runtime state at the start of a generation."""
+        """Reset TeaCache per-generation runtime state (not calibration data)."""
         self.teacache_num_steps = num_steps
         self.teacache_cnt = 0
         self.teacache_accum = 0.0
         self.teacache_prev_modulated = None
         self.teacache_prev_residual = None
+        self._teacache_pending_x = None
+        self.teacache_computed_steps = 0
 
     def enable_deterministic(self):
         for block in self.double_blocks:
@@ -1515,11 +1524,26 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                     shift=img_mod1_shift,
                     scale=img_mod1_scale,
                 )
-                if (self.teacache_cnt == 0
+                if self.teacache_calibrate:
+                    # Calibration: always compute; just record the input rel-L1.
+                    should_calc = True
+                    if self.teacache_prev_modulated is not None:
+                        self._teacache_pending_x = (
+                            (modulated_inp - self.teacache_prev_modulated).abs().mean()
+                            / self.teacache_prev_modulated.abs().mean()
+                        ).cpu().item()
+                    else:
+                        self._teacache_pending_x = None
+                    self.teacache_prev_modulated = modulated_inp
+                elif (self.teacache_cnt == 0
                         or self.teacache_cnt == self.teacache_num_steps - 1):
                     # Never skip the first or last denoising step.
                     should_calc = True
                     self.teacache_accum = 0.0
+                    self.teacache_prev_modulated = modulated_inp
+                    self.teacache_cnt += 1
+                    if self.teacache_cnt == self.teacache_num_steps:
+                        self.teacache_cnt = 0
                 else:
                     rescale_func = np.poly1d(self.teacache_coefficients)
                     rel_l1 = (
@@ -1532,12 +1556,19 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                     else:
                         should_calc = True
                         self.teacache_accum = 0.0
-                self.teacache_prev_modulated = modulated_inp
-                self.teacache_cnt += 1
-                if self.teacache_cnt == self.teacache_num_steps:
-                    self.teacache_cnt = 0
+                    self.teacache_prev_modulated = modulated_inp
+                    self.teacache_cnt += 1
+                    if self.teacache_cnt == self.teacache_num_steps:
+                        self.teacache_cnt = 0
             else:
                 should_calc = True
+
+            if teacache_active:
+                logger.info(
+                    f"[TeaCache] {'COMPUTE (run model)' if should_calc else 'REUSE cached residual (skip model)'}"
+                    f" | accum={self.teacache_accum:.4f} thresh={self.teacache_thresh}"
+                    f" calibrate={self.teacache_calibrate}"
+                )
 
             if teacache_active and not should_calc:
                 # Reuse the previous step's residual; skip the whole body.
@@ -1545,6 +1576,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             else:
                 if teacache_active:
                     ori_img = img.clone()
+                    self.teacache_computed_steps += 1
 
                 if self.use_context_block:
                     cond_seq_len = condition.shape[1]
@@ -1658,7 +1690,17 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                 img = x[:, :img_seq_len, ...]
 
                 if teacache_active:
-                    self.teacache_prev_residual = img - ori_img
+                    new_residual = img - ori_img
+                    if (self.teacache_calibrate
+                            and self._teacache_pending_x is not None
+                            and self.teacache_prev_residual is not None):
+                        y = (
+                            (new_residual - self.teacache_prev_residual).abs().mean()
+                            / self.teacache_prev_residual.abs().mean()
+                        ).cpu().item()
+                        self.teacache_cal_data.append(
+                            (self._teacache_pending_x, y))
+                    self.teacache_prev_residual = new_residual
 
         # ---------------------------- Final layer ------------------------------
         # (N, T, patch_size ** 2 * out_channels)

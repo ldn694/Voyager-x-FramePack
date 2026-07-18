@@ -1326,6 +1326,16 @@ Please use VaeImageProcessor.postprocess(...) instead"
                         torch.cuda.empty_cache()
                 # ==========================================================
 
+        # TeaCache summary for this generation.
+        if getattr(self.transformer, "enable_teacache", False) and logger is not None:
+            computed = getattr(self.transformer, "teacache_computed_steps", 0)
+            skipped = num_inference_steps - computed
+            speedup = (num_inference_steps / computed) if computed > 0 else float("nan")
+            logger.info(
+                f"[TeaCache] computed {computed}/{num_inference_steps} steps "
+                f"(skipped {skipped}) -> {speedup:.2f}x fewer model passes"
+            )
+
         if not output_type == "latent":
             expand_temporal_dim = False
             if len(latents.shape) == 4:
