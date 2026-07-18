@@ -47,6 +47,8 @@ def main():
         seed=args.seed,
         negative_prompt=args.neg_prompt,
         infer_steps=args.infer_steps,
+        with_teacache=args.with_teacache,
+        teacache_thresh=args.teacache_thresh,
         guidance_scale=args.cfg_scale,
         num_videos_per_prompt=args.num_videos,
         flow_shift=args.flow_shift,

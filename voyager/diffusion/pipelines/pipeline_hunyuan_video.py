@@ -1079,6 +1079,11 @@ Please use VaeImageProcessor.postprocess(...) instead"
             mode_schedule = ["custom"] * num_inference_steps
         logger.info(f"Using mode schedule: {mode_schedule}")
 
+        # Reset TeaCache runtime state so the skip decision is scoped to this
+        # generation (the eval loop reuses a single sampler across clips).
+        if getattr(self.transformer, "enable_teacache", False):
+            self.transformer.teacache_reset(num_inference_steps)
+
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:

@@ -857,9 +857,26 @@ class HunyuanVideoSampler(Inference):
         step_sample=0,
         attn_map=0,
         dmd2_steps=0,
+        with_teacache=False,
+        teacache_thresh=0.15,
         **kwargs,
     ):
         out_dict = dict()
+
+        # Configure TeaCache on the transformer for this run.
+        if hasattr(self.pipeline, "transformer"):
+            transformer = self.pipeline.transformer
+            transformer.enable_teacache = with_teacache
+            transformer.teacache_thresh = teacache_thresh
+            if with_teacache and (
+                getattr(transformer, "patch_sizes", None) is not None
+                or getattr(transformer, "use_second_branch", False)
+            ):
+                logger.warning(
+                    "--with-teacache is only supported on the standard "
+                    "single-branch path; it will be ignored for this "
+                    "multi-kernel / double-branch model."
+                )
 
         if isinstance(seed, torch.Tensor):
             seed = seed.tolist()

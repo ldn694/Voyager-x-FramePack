@@ -613,6 +613,19 @@ def add_inference_args(parser: argparse.ArgumentParser):
         help="Disable autocast for denoising loop and vae decoding in pipeline sampling.",
     )
     group.add_argument(
+        "--with-teacache",
+        action="store_true",
+        help="Enable TeaCache training-free step caching at inference "
+             "(standard single-branch path only).",
+    )
+    group.add_argument(
+        "--teacache-thresh",
+        type=float,
+        default=0.15,
+        help="TeaCache rel-L1 accumulation threshold (delta). Higher = more "
+             "cached steps = faster but lower fidelity. ~0.15 quality, ~0.25 fast.",
+    )
+    group.add_argument(
         "--save-path",
         type=str,
         default="./results",

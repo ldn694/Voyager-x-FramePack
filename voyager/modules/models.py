@@ -3,6 +3,7 @@ from einops import rearrange
 from loguru import logger
 import os
 import matplotlib.pyplot as plt
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -1146,6 +1147,31 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             self.zero_linear1 = nn.Linear(self.hidden_size, self.hidden_size)
             self.zero_linear2 = nn.Linear(self.hidden_size, self.hidden_size)
 
+        # ---------------------------- TeaCache ------------------------------
+        # Training-free timestep-embedding-aware caching (https://arxiv.org/abs/2411.19108).
+        # All defaults are no-ops so non-TeaCache runs are unaffected. State is
+        # (re)initialized per generation by the sampling pipeline.
+        self.enable_teacache = False
+        self.teacache_thresh = 0.15          # δ: accumulated rescaled rel-L1 threshold
+        self.teacache_num_steps = 0          # set to num_inference_steps by the pipeline
+        self.teacache_cnt = 0
+        self.teacache_accum = 0.0
+        self.teacache_prev_modulated = None
+        self.teacache_prev_residual = None
+        # Degree-4 poly1d rescale, official TeaCache HunyuanVideo coefficients.
+        self.teacache_coefficients = [
+            7.33226126e+02, -4.01131952e+02, 6.75869174e+01,
+            -3.14987800e+00, 9.61237896e-02,
+        ]
+
+    def teacache_reset(self, num_steps: int):
+        """Reset TeaCache runtime state at the start of a generation."""
+        self.teacache_num_steps = num_steps
+        self.teacache_cnt = 0
+        self.teacache_accum = 0.0
+        self.teacache_prev_modulated = None
+        self.teacache_prev_residual = None
+
     def enable_deterministic(self):
         for block in self.double_blocks:
             block.enable_deterministic()
@@ -1473,116 +1499,166 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             max_seqlen_q = img_seq_len + txt_seq_len
             max_seqlen_kv = max_seqlen_q
 
-            if self.use_context_block:
-                cond_seq_len = condition.shape[1]
-                cu_seqlens_q_cond = get_cu_seqlens(text_mask, cond_seq_len)
-                cu_seqlens_kv_cond = cu_seqlens_q_cond
-                max_seqlen_q_cond = cond_seq_len + txt_seq_len
-                max_seqlen_kv_cond = max_seqlen_q_cond
-
-                # ---------------------------- Context Block ------------------------------
-                context_block_args = [
-                    condition,
-                    txt,
-                    vec,
-                    cu_seqlens_q_cond,
-                    cu_seqlens_kv_cond,
-                    max_seqlen_q_cond,
-                    max_seqlen_kv_cond,
-                    (freqs_cos_cond, freqs_sin_cond),
-                    # (freqs_cos, freqs_sin),
-                    self.i2v_condition_type,
-                    token_replace_vec,
-                    frist_frame_token_num,
-                ]
-                condition1, txt1 = self.context_block1(*context_block_args)
-
-                condition2 = torch.cat((condition1, txt1), 1)
-                context_block_args = [
-                    condition2,
-                    vec,
-                    txt_seq_len,
-                    cu_seqlens_q_cond,
-                    cu_seqlens_kv_cond,
-                    max_seqlen_q_cond,
-                    max_seqlen_kv_cond,
-                    (freqs_cos_cond, freqs_sin_cond),
-                    # (freqs_cos, freqs_sin),
-                    self.i2v_condition_type,
-                    token_replace_vec,
-                    frist_frame_token_num,
-                ]
-                condition2 = self.context_block2(*context_block_args)
-
-                condition1 = self.zero_linear1(condition1)
-                condition2 = self.zero_linear2(condition2)
-
-                condition2 = torch.cat(
-                    (torch.zeros_like(img)[:, :-condition1.shape[1]], condition2), dim=1)
-                condition1 = torch.cat(
-                    (torch.zeros_like(img)[:, :-condition1.shape[1]], condition1), dim=1)
-
-            freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
-            # --------------------- Pass through DiT blocks ------------------------
-            for layer_num, block in enumerate(self.double_blocks):
-                double_block_args = [
-                    img,
-                    txt,
-                    vec,
-                    cu_seqlens_q,
-                    cu_seqlens_kv,
-                    max_seqlen_q,
-                    max_seqlen_kv,
-                    freqs_cis,
-                    self.i2v_condition_type,
-                    token_replace_vec,
-                    frist_frame_token_num,
-                ]
-
-                if self.training and self.gradient_checkpoint and \
-                        (self.gradient_checkpoint_layers == -1 or layer_num < self.gradient_checkpoint_layers):
-                    # print(f'gradient checkpointing...')
-                    img, txt = torch.utils.checkpoint.checkpoint(
-                        ckpt_wrapper(block), *double_block_args, use_reentrant=False)
-                    if self.use_context_block:
-                        img += condition1
+            # ------------------------- TeaCache gate -------------------------
+            # Decide whether to recompute the transformer body or reuse the
+            # cached residual. Only supported on the standard single-branch path.
+            teacache_active = (
+                self.enable_teacache
+                and self.patch_sizes is None
+                and not self.use_second_branch
+            )
+            if teacache_active:
+                (img_mod1_shift, img_mod1_scale) = \
+                    self.double_blocks[0].img_mod(vec).chunk(6, dim=-1)[:2]
+                modulated_inp = modulate(
+                    self.double_blocks[0].img_norm1(img),
+                    shift=img_mod1_shift,
+                    scale=img_mod1_scale,
+                )
+                if (self.teacache_cnt == 0
+                        or self.teacache_cnt == self.teacache_num_steps - 1):
+                    # Never skip the first or last denoising step.
+                    should_calc = True
+                    self.teacache_accum = 0.0
                 else:
-                    img, txt = block(*double_block_args)
-                    if self.use_context_block:
-                        img += condition1
+                    rescale_func = np.poly1d(self.teacache_coefficients)
+                    rel_l1 = (
+                        (modulated_inp - self.teacache_prev_modulated).abs().mean()
+                        / self.teacache_prev_modulated.abs().mean()
+                    ).cpu().item()
+                    self.teacache_accum += rescale_func(rel_l1)
+                    if self.teacache_accum < self.teacache_thresh:
+                        should_calc = False
+                    else:
+                        should_calc = True
+                        self.teacache_accum = 0.0
+                self.teacache_prev_modulated = modulated_inp
+                self.teacache_cnt += 1
+                if self.teacache_cnt == self.teacache_num_steps:
+                    self.teacache_cnt = 0
+            else:
+                should_calc = True
 
-            # Merge txt and img to pass through single stream blocks.
-            x = torch.cat((img, txt), 1)
+            if teacache_active and not should_calc:
+                # Reuse the previous step's residual; skip the whole body.
+                img = img + self.teacache_prev_residual
+            else:
+                if teacache_active:
+                    ori_img = img.clone()
 
-            if len(self.single_blocks) > 0:
-                for _, block in enumerate(self.single_blocks):
-                    single_block_args = [
-                        x,
+                if self.use_context_block:
+                    cond_seq_len = condition.shape[1]
+                    cu_seqlens_q_cond = get_cu_seqlens(text_mask, cond_seq_len)
+                    cu_seqlens_kv_cond = cu_seqlens_q_cond
+                    max_seqlen_q_cond = cond_seq_len + txt_seq_len
+                    max_seqlen_kv_cond = max_seqlen_q_cond
+
+                    # ---------------------------- Context Block ------------------------------
+                    context_block_args = [
+                        condition,
+                        txt,
+                        vec,
+                        cu_seqlens_q_cond,
+                        cu_seqlens_kv_cond,
+                        max_seqlen_q_cond,
+                        max_seqlen_kv_cond,
+                        (freqs_cos_cond, freqs_sin_cond),
+                        # (freqs_cos, freqs_sin),
+                        self.i2v_condition_type,
+                        token_replace_vec,
+                        frist_frame_token_num,
+                    ]
+                    condition1, txt1 = self.context_block1(*context_block_args)
+
+                    condition2 = torch.cat((condition1, txt1), 1)
+                    context_block_args = [
+                        condition2,
                         vec,
                         txt_seq_len,
+                        cu_seqlens_q_cond,
+                        cu_seqlens_kv_cond,
+                        max_seqlen_q_cond,
+                        max_seqlen_kv_cond,
+                        (freqs_cos_cond, freqs_sin_cond),
+                        # (freqs_cos, freqs_sin),
+                        self.i2v_condition_type,
+                        token_replace_vec,
+                        frist_frame_token_num,
+                    ]
+                    condition2 = self.context_block2(*context_block_args)
+
+                    condition1 = self.zero_linear1(condition1)
+                    condition2 = self.zero_linear2(condition2)
+
+                    condition2 = torch.cat(
+                        (torch.zeros_like(img)[:, :-condition1.shape[1]], condition2), dim=1)
+                    condition1 = torch.cat(
+                        (torch.zeros_like(img)[:, :-condition1.shape[1]], condition1), dim=1)
+
+                freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
+                # --------------------- Pass through DiT blocks ------------------------
+                for layer_num, block in enumerate(self.double_blocks):
+                    double_block_args = [
+                        img,
+                        txt,
+                        vec,
                         cu_seqlens_q,
                         cu_seqlens_kv,
                         max_seqlen_q,
                         max_seqlen_kv,
-                        (freqs_cos, freqs_sin),
+                        freqs_cis,
                         self.i2v_condition_type,
                         token_replace_vec,
                         frist_frame_token_num,
                     ]
 
                     if self.training and self.gradient_checkpoint and \
-                            (self.gradient_checkpoint_layers == -1 or \
-                            layer_num + len(self.double_blocks) < self.gradient_checkpoint_layers):
-                        x = torch.utils.checkpoint.checkpoint(ckpt_wrapper(
-                            block), *single_block_args, use_reentrant=False)
+                            (self.gradient_checkpoint_layers == -1 or layer_num < self.gradient_checkpoint_layers):
+                        # print(f'gradient checkpointing...')
+                        img, txt = torch.utils.checkpoint.checkpoint(
+                            ckpt_wrapper(block), *double_block_args, use_reentrant=False)
                         if self.use_context_block:
-                            x += condition2
+                            img += condition1
                     else:
-                        x = block(*single_block_args)
+                        img, txt = block(*double_block_args)
                         if self.use_context_block:
-                            x += condition2
+                            img += condition1
 
-            img = x[:, :img_seq_len, ...]
+                # Merge txt and img to pass through single stream blocks.
+                x = torch.cat((img, txt), 1)
+
+                if len(self.single_blocks) > 0:
+                    for _, block in enumerate(self.single_blocks):
+                        single_block_args = [
+                            x,
+                            vec,
+                            txt_seq_len,
+                            cu_seqlens_q,
+                            cu_seqlens_kv,
+                            max_seqlen_q,
+                            max_seqlen_kv,
+                            (freqs_cos, freqs_sin),
+                            self.i2v_condition_type,
+                            token_replace_vec,
+                            frist_frame_token_num,
+                        ]
+
+                        if self.training and self.gradient_checkpoint and \
+                                (self.gradient_checkpoint_layers == -1 or \
+                                layer_num + len(self.double_blocks) < self.gradient_checkpoint_layers):
+                            x = torch.utils.checkpoint.checkpoint(ckpt_wrapper(
+                                block), *single_block_args, use_reentrant=False)
+                            if self.use_context_block:
+                                x += condition2
+                        else:
+                            x = block(*single_block_args)
+                            if self.use_context_block:
+                                x += condition2
+
+                img = x[:, :img_seq_len, ...]
+
+                if teacache_active:
+                    self.teacache_prev_residual = img - ori_img
 
         # ---------------------------- Final layer ------------------------------
         # (N, T, patch_size ** 2 * out_channels)
